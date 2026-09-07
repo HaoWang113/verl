@@ -1100,6 +1100,7 @@ class vLLMHttpServer:
         checkpoint_config = getattr(self.config, "checkpoint_engine", None)
         if getattr(checkpoint_config, "backend", None) == "delta_sharded":
             from verl.workers.rollout.vllm_rollout.delta_weight_transfer import (
+                VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND,
                 VERL_DELTA_WEIGHT_TRANSFER_BACKEND,
                 is_moe_model,
                 require_vllm_delta_support,
@@ -1128,6 +1129,11 @@ class vLLMHttpServer:
                 )
 
             if is_moe_model(self.model_config.hf_config):
+                if is_torch_npu_available(check_device=False):
+                    raise NotImplementedError(
+                        "delta_sharded with vLLM does not support MoE models on Ascend NPU yet: NPU has no "
+                        "Triton, and the vllm-ascend MoE kernel path is Phase 2 scope; use a dense model"
+                    )
                 moe_backend = engine_kwargs.get("moe_backend")
                 if moe_backend not in {None, "auto", "triton"}:
                     raise NotImplementedError(
@@ -1145,13 +1151,21 @@ class vLLMHttpServer:
             else:
                 raise TypeError("weight_transfer_config must be a mapping when using delta_sharded")
 
-            if weight_transfer_backend not in {None, VERL_DELTA_WEIGHT_TRANSFER_BACKEND}:
+            allowed_backends = {VERL_DELTA_WEIGHT_TRANSFER_BACKEND, VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND}
+            if weight_transfer_backend not in ({None} | allowed_backends):
                 raise ValueError(
-                    "checkpoint_engine.backend='delta_sharded' requires vLLM "
-                    f"weight transfer backend {VERL_DELTA_WEIGHT_TRANSFER_BACKEND!r}, "
+                    "checkpoint_engine.backend='delta_sharded' requires one of the VERL vLLM weight "
+                    f"transfer backends {sorted(allowed_backends)} (or none, for the platform default), "
                     f"but got {weight_transfer_backend!r}"
                 )
-            engine_kwargs["weight_transfer_config"] = {"backend": VERL_DELTA_WEIGHT_TRANSFER_BACKEND}
+            if weight_transfer_backend is None:
+                # Platform default: HCCL receivers on Ascend NPU, CUDA IPC elsewhere.
+                weight_transfer_backend = (
+                    VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND
+                    if is_torch_npu_available(check_device=False)
+                    else VERL_DELTA_WEIGHT_TRANSFER_BACKEND
+                )
+            engine_kwargs["weight_transfer_config"] = {"backend": weight_transfer_backend}
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""
