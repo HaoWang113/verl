@@ -307,12 +307,12 @@ class ServerAdapter(BaseRollout):
             raise NotImplementedError("delta_sharded with vLLM requires colocated CUDA IPC")
         if not self._delta_weight_transfer_engine_initialized:
             await self._execute_method(
-                "init_weight_transfer_engine",
+                "verl_delta_init_weight_transfer_engine",
                 kwargs={"init_info": {}},
             )
             self._delta_weight_transfer_engine_initialized = True
 
-        await self._execute_method("start_weight_update")
+        await self._execute_method("verl_delta_start_weight_update")
 
         async def send_flush(flush_tensors: list[tuple[str, torch.Tensor]]) -> None:
             receiver_future = await self._execute_method(
@@ -339,7 +339,7 @@ class ServerAdapter(BaseRollout):
         if not saw_last:
             raise ValueError("DeltaFlush stream ended without is_last=True")
 
-        await self._execute_method("finish_weight_update")
+        await self._execute_method("verl_delta_finish_weight_update")
 
         if self._has_server:
             await self.server_handle.clear_kv_cache.remote()
@@ -349,16 +349,17 @@ class ServerAdapter(BaseRollout):
     async def _update_delta_weights_hccl(self, rendezvous: dict, flushes, *, global_steps: int | None) -> None:
         """C1 delta sync: the flush payloads flow trainer -> vLLM worker PyHccl group directly.
 
-        This adapter only drives the worker engines' lifecycle RPCs: init (once,
-        with the rendezvous endpoints), start, a single update whose per-worker
-        entries carry each worker's group rank, and finish. The worker engines
+        This adapter only drives the worker engines' lifecycle RPCs
+        (verl_delta_init once with the rendezvous endpoints, verl_delta_start,
+        a single update_verl_delta_weights whose per-worker entries carry each
+        worker's group rank, verl_delta_finish). The worker engines
         subscribe to the trainer's zmq manifest PUB socket and receive the
         broadcasts themselves; the update RPC returns only after the session's
         last flush is applied, so no further synchronization is needed here.
         """
         if not self._delta_weight_transfer_engine_initialized:
             await self._execute_method(
-                "init_weight_transfer_engine",
+                "verl_delta_init_weight_transfer_engine",
                 kwargs={
                     "init_info": {
                         "dist_ip": rendezvous["dist_ip"],
@@ -372,12 +373,12 @@ class ServerAdapter(BaseRollout):
             )
             self._delta_weight_transfer_engine_initialized = True
 
-        await self._execute_method("start_weight_update")
+        await self._execute_method("verl_delta_start_weight_update")
 
         update_infos = _hccl_group_update_infos(self.replica_rank, self.config.tensor_model_parallel_size)
         await self._execute_method("update_verl_delta_weights", kwargs={"update_info": update_infos})
 
-        await self._execute_method("finish_weight_update")
+        await self._execute_method("verl_delta_finish_weight_update")
 
         # The rendezvous stream carries no further items; drain to close it.
         async for _ in flushes:

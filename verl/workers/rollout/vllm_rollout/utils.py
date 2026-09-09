@@ -429,17 +429,47 @@ class vLLMColocateWorkerExtension:
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
 
     def update_verl_delta_weights(self, update_info: dict | list[dict]) -> None:
-        """Forward the delta update to vLLM, adding this worker's IPC endpoint
-        when the payload travels over the colocated zmq/IPC channel."""
-        if isinstance(update_info, list):
-            # HCCL broadcast path: per-worker entries already carry each
-            # worker's group rank, and WorkerBase.update_weights indexes the
-            # list by worker rank itself.
+        """Forward the delta update to the transfer engine, adding this
+        worker's IPC endpoint when the payload travels over the colocated
+        zmq/IPC channel."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not isinstance(update_info, list):
+            update_info = {**update_info, "zmq_handle": self._get_zmq_handle()}
+        if not v023_compat.worker_update_weights(self, update_info):
+            # vllm 0.23.x compat handled the engine above; on #44353 hosts the
+            # host worker's update_weights indexes per-worker list entries
+            # (HCCL broadcast path) and drives the engine itself.
             self.update_weights(update_info)
-            return
-        worker_update_info = dict(update_info)
-        worker_update_info["zmq_handle"] = self._get_zmq_handle()
-        self.update_weights(worker_update_info)
+
+    # ---- vllm 0.23.x compat lifecycle RPCs (NOT FOR UPSTREAM) -------------
+    # vLLM appends worker extension classes AFTER the worker class in the MRO
+    # and asserts the extension defines no attribute the worker already has,
+    # so these use VERL-specific names instead of overriding the host's
+    # lifecycle methods. On hosts where the engine is not a VERL 0.23.x
+    # compat engine they delegate to the host worker methods unchanged.
+    # See delta_weight_transfer_v023_compat.
+
+    def verl_delta_init_weight_transfer_engine(self, init_info: dict) -> None:
+        """init_weight_transfer_engine with the vllm 0.23.x compat dispatch."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not v023_compat.worker_init_weight_transfer_engine(self, init_info):
+            self.init_weight_transfer_engine(init_info)
+
+    def verl_delta_start_weight_update(self, *args, **kwargs) -> None:
+        """start_weight_update with the vllm 0.23.x compat dispatch."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not v023_compat.worker_start_weight_update(self):
+            self.start_weight_update(*args, **kwargs)
+
+    def verl_delta_finish_weight_update(self, *args, **kwargs) -> None:
+        """finish_weight_update with the vllm 0.23.x compat dispatch."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not v023_compat.worker_finish_weight_update(self):
+            self.finish_weight_update(*args, **kwargs)
 
 
 class SuppressSignalInThread:

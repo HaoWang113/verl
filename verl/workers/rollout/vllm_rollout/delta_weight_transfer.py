@@ -20,7 +20,6 @@ checkpoint names, packed weights, and TP slicing.
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -63,23 +62,35 @@ def _checkpoint_patch_api():
     except ImportError as exc:
         if exc.name != "vllm.model_executor.model_loader.checkpoint_weight_patch":
             raise
-        raise RuntimeError(
-            "checkpoint_engine.backend='delta_sharded' with vLLM requires the checkpoint patch API from "
-            f"vLLM #50723; installed vLLM {getattr(vllm, '__version__', 'unknown')} does not provide it. "
-            "Install a compatible vLLM build or select a different checkpoint engine backend."
-        ) from exc
+        # vllm 0.23.x compat (NOT FOR UPSTREAM): fall back to the vendored copy
+        # of vLLM #50723; see delta_weight_transfer_v023_compat.
+        from verl.workers.rollout.vllm_rollout._vendored.checkpoint_weight_patch import (
+            CheckpointWeightPatch,
+            load_checkpoint_weight_patches,
+        )
+        return CheckpointWeightPatch, load_checkpoint_weight_patches
     return CheckpointWeightPatch, load_checkpoint_weight_patches
 
 
 def require_vllm_delta_support() -> None:
-    """Verify that vLLM provides the required weight transfer and checkpoint patch APIs."""
+    """Verify that vLLM provides the required weight transfer and checkpoint patch APIs.
 
-    init_parameters = inspect.signature(WeightTransferEngine.__init__).parameters
-    if not {"config", "vllm_config", "device", "model"}.issubset(init_parameters):
+    Accepts either a #44353 host (engine-owned WeightTransferEngine API) or,
+    through the vllm 0.23.x compat shim, a vLLM 0.23.x host; anything else
+    fails loud. NOT FOR UPSTREAM: the 0.23.x leg is deployment/test-only
+    (see delta_weight_transfer_v023_compat).
+    """
+    from verl.workers.rollout.vllm_rollout.delta_weight_transfer_v023_compat import (
+        HOST_UNSUPPORTED,
+        classify_installed_host,
+    )
+
+    if classify_installed_host() == HOST_UNSUPPORTED:
         raise RuntimeError(
             "checkpoint_engine.backend='delta_sharded' with vLLM requires the engine-owned WeightTransferEngine "
-            "API from vLLM #44353 and the checkpoint patch API from vLLM #50723; installed vLLM "
-            f"{getattr(vllm, '__version__', 'unknown')} does not provide the required WeightTransferEngine API. "
+            "API from vLLM #44353 and the checkpoint patch API from vLLM #50723, or a vLLM 0.23.x host through "
+            "verl's compat shim (other pre-#44353 versions are not covered); installed vLLM "
+            f"{getattr(vllm, '__version__', 'unknown')} provides neither. "
             "Install a compatible vLLM build or select a different checkpoint engine backend."
         )
     _checkpoint_patch_api()
@@ -300,6 +311,15 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         raise NotImplementedError("VERL sends DeltaFlush payloads; this adapter only receives them")
 
 
+def _compat_engine_cls(engine_cls: type) -> type:
+    """vllm 0.23.x compat hook (NOT FOR UPSTREAM): swap the feature engine
+    class for its 0.23.x subclass when the installed vLLM predates #44353;
+    identity on #44353 hosts. See delta_weight_transfer_v023_compat."""
+    from verl.workers.rollout.vllm_rollout.delta_weight_transfer_v023_compat import compat_engine_cls
+
+    return compat_engine_cls(engine_cls)
+
+
 def register_verl_delta_weight_transfer_engine() -> None:
     """Register the adapter before vLLM creates its worker-side engine."""
 
@@ -310,7 +330,7 @@ def register_verl_delta_weight_transfer_engine() -> None:
 
     WeightTransferEngineFactory.register_engine(
         VERL_DELTA_WEIGHT_TRANSFER_BACKEND,
-        VerlDeltaIPCWeightTransferEngine,
+        _compat_engine_cls(VerlDeltaIPCWeightTransferEngine),
     )
     _REGISTERED = True
 
@@ -431,6 +451,6 @@ def register_verl_delta_hccl_weight_transfer_engine() -> None:
 
     WeightTransferEngineFactory.register_engine(
         VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND,
-        VerlDeltaHCCLWeightTransferEngine,
+        _compat_engine_cls(VerlDeltaHCCLWeightTransferEngine),
     )
     _HCCL_REGISTERED = True
