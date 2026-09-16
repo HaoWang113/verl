@@ -317,5 +317,30 @@ Planned extensions, in design order:
   TP column splits are already expressible as a ``BlockPlacement`` dim-1 offset (see #7060).
 - **Quantized rollout (fp8 etc.)**: diff the quantized bytes (quantize-then-diff) so a low-precision
   rollout engine can consume deltas without a bf16 intermediate.
-- **NPU MoE delta updates**: the vllm-ascend kernel path for MoE delta loads (Triton-only on CUDA
-  today), which lifts the NPU dense-model restriction of the HCCL transport.
+- **NPU MoE delta updates**: supported for unquantized BF16 MoE models through the checkpoint-layout
+  window (see "MoE on Ascend NPU" below); the loader-level layout awareness (flipping the load block
+  instead of the live parameter) remains the long-term refinement that removes the per-round flip.
+
+## MoE on Ascend NPU (checkpoint-layout window)
+
+vllm-ascend transposes fused-expert weights after load (``transpose(1, 2)`` per w13/w2, plus
+conditional NZ / per-expert-list variants), while sparse patches carry checkpoint coordinates.
+During an ``indices``-encoded update session the receiver therefore opens a **layout window**:
+every fused-expert module is flipped back to checkpoint layout before the first sparse flush
+(``moe_online_update.py``), and the load-time transforms are replayed when the session finishes —
+the sparse counterpart of the dense reload lifecycle. The pad step is a no-op on NPU (vLLM core
+``_maybe_pad_weight`` is ROCm-only), so the flip is a pure shape permutation and the round trip is
+bit-exact.
+
+Support matrix and guards (all refusals are fail-loud, never silent):
+
+| Configuration | Behavior |
+|---|---|
+| Unquantized BF16 MoE, ND layout, no MC2/EPLB, ``weight_nz_mode=0`` | Supported (main path) |
+| ``moe_backend`` pinned on NPU | Rejected at startup — NPU relies on the layout window, not a kernel backend |
+| ``enable_eplb`` / megamoe / fused-MC2 (per-expert lists) | Rejected — no in-place write target |
+| ``weight_nz_mode != 0`` (or 310P / FORCE_NZ profile) | Rejected at session start — no verified NZ inverse |
+| Unknown vllm-ascend transform fingerprint | Rejected before the first flip (version allowlist + per-layer state asserts) |
+
+A failed window closes best-effort once; the worker then follows the poisoned-worker contract
+(restart the full job). Verify on NPU with ``tests/special_npu/MOE_DELTA_TEST_GUIDE.md`` (L7).

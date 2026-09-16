@@ -20,6 +20,7 @@ checkpoint names, packed weights, and TP slicing.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,8 @@ import torch
 import vllm
 
 from verl.utils.device import get_device_name
+
+logger = logging.getLogger(__name__)
 
 try:
     from vllm.config.weight_transfer import WeightTransferConfig
@@ -46,6 +49,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.checkpoint_weight_patch import (
         CheckpointWeightPatch,
     )
+    from verl.workers.rollout.vllm_rollout.moe_online_update import ExpertLayoutWindow
 
 VERL_DELTA_WEIGHT_TRANSFER_BACKEND = "verl_delta_ipc"
 VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND = "verl_delta_hccl"
@@ -94,6 +98,35 @@ def require_vllm_delta_support() -> None:
             "Install a compatible vLLM build or select a different checkpoint engine backend."
         )
     _checkpoint_patch_api()
+
+
+def resolve_moe_delta_settings(*, is_npu: bool, moe_backend: Any, enable_eplb: bool) -> str | None:
+    """Validate MoE delta settings per platform; return the backend to force, if any.
+
+    CUDA keeps the historical triton-only contract (identical raise order and
+    messages). NPU no longer rejects MoE outright: the sparse layout window
+    (moe_online_update) replaces the kernel-backend requirement, so backend
+    pins are refused and the vllm-ascend default stays untouched. EPLB is
+    refused on both platforms -- dynamic_eplb splits expert weights into
+    per-expert lists with no in-place write target.
+    """
+    if is_npu:
+        if moe_backend not in {None, "auto"}:
+            raise NotImplementedError(
+                "delta_sharded with vLLM MoE on Ascend NPU relies on the checkpoint-layout window, not a kernel "
+                f"backend; leave moe_backend unset or 'auto' (got {moe_backend!r})"
+            )
+        if enable_eplb:
+            raise NotImplementedError(
+                "delta_sharded with vLLM MoE does not support EPLB (dynamic_eplb splits expert weights into "
+                "per-expert lists)"
+            )
+        return None
+    if moe_backend not in {None, "auto", "triton"}:
+        raise NotImplementedError(f"delta_sharded with vLLM MoE requires moe_backend='triton'; got {moe_backend!r}")
+    if enable_eplb:
+        raise NotImplementedError("delta_sharded with vLLM MoE does not support EPLB")
+    return "triton"
 
 
 def is_moe_model(hf_config) -> bool:
@@ -187,6 +220,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         super().__init__(config, vllm_config, device, model)
         self._session_encoding: str | None = None
         self._update_failed = False
+        self._sparse_session_begun = False
 
     def _validate_configuration(self) -> None:
         require_vllm_delta_support()
@@ -213,7 +247,30 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 "fresh dense seed. Restarting only the vLLM workers is unsafe because the producer snapshot may "
                 "already have advanced."
             )
+        if self._sparse_session_begun:
+            raise RuntimeError(
+                "A previous sparse weight-update session never finished cleanly; restart the full job so every "
+                "rollout worker receives a fresh dense seed."
+            )
         self._session_encoding = None
+
+    def _on_sparse_session_begin(self) -> None:
+        """Prepare the model for in-place checkpoint-coordinate patches.
+
+        Invoked once, right before the first ``indices``-encoded flush of an
+        update session is applied. Default no-op: the reference engines run on
+        platforms whose live parameters already use checkpoint layout, so
+        sparse patches land correctly as-is. Platform engines override this to
+        open a layout window (see VerlDeltaHCCLWeightTransferEngine on Ascend
+        NPU, where MoE expert weights are stored transposed after load).
+        """
+
+    def _on_sparse_session_end(self) -> None:
+        """Close the layout window opened by :meth:`_on_sparse_session_begin`.
+
+        Invoked from ``finish_weight_update`` (and once, best effort, from the
+        failure path). Default no-op for the same reason as above.
+        """
 
     def _receive_payload(self, *, zmq_handle: str) -> list[tuple[str, torch.Tensor]]:
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
@@ -257,6 +314,12 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 )
 
                 initialize_layerwise_reload(self.model)
+            else:
+                # Sparse patches are written in place at checkpoint
+                # coordinates: open the layout window before the first flush
+                # lands (no-op on reference engines).
+                self._sparse_session_begun = True
+                self._on_sparse_session_begin()
         elif encoding != self._session_encoding:
             raise ValueError(
                 "One weight update cannot mix dense and sparse DeltaFlush payloads "
@@ -280,6 +343,19 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         except BaseException:
             # An earlier flush may already have changed runtime weights, so a
             # later update would start from an unknown partial state.
+            if self._sparse_session_begun:
+                # Best effort: close the layout window so the poisoned-worker
+                # restart contract is the only remaining failure mode. Exactly
+                # one end attempt (flag cleared first) -- never re-enter a
+                # partially restored model.
+                self._sparse_session_begun = False
+                try:
+                    self._on_sparse_session_end()
+                except BaseException:
+                    logger.exception(
+                        "best-effort sparse session restore failed; restart the full job so every rollout worker "
+                        "receives a fresh dense seed"
+                    )
             self._update_failed = True
             raise
 
@@ -296,12 +372,23 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             except BaseException:
                 self._update_failed = True
                 raise
-        # Sparse updates write to initialized runtime tensors, so there is
-        # nothing to rebuild after the last flush.
+        elif self._session_encoding == "indices":
+            # Sparse updates replay platform load-time transforms to return
+            # live parameters to runtime layout (no-op on reference engines).
+            try:
+                self._on_sparse_session_end()
+            except BaseException:
+                self._update_failed = True
+                raise
+            finally:
+                # Exactly one end attempt: never re-enter a partially restored
+                # model; the poisoned-worker contract takes over.
+                self._sparse_session_begun = False
         self._session_encoding = None
 
     def shutdown(self) -> None:
         self._session_encoding = None
+        self._sparse_session_begun = False
 
     @staticmethod
     def trainer_send_weights(
@@ -377,6 +464,7 @@ class VerlDeltaHCCLWeightTransferEngine(VerlDeltaIPCWeightTransferEngine):
         self._manifest_sub = None
         self._comm = None
         self._group_rank: int | None = None
+        self._expert_layout_window: "ExpertLayoutWindow | None" = None
 
     def _validate_configuration(self) -> None:
         require_vllm_delta_support()
@@ -439,6 +527,30 @@ class VerlDeltaHCCLWeightTransferEngine(VerlDeltaIPCWeightTransferEngine):
         except BaseException:
             self._update_failed = True
             raise
+
+    def _on_sparse_session_begin(self) -> None:
+        from verl.workers.rollout.vllm_rollout.moe_online_update import open_expert_layout_window
+
+        self._expert_layout_window = open_expert_layout_window(self.model)
+
+    def _on_sparse_session_end(self) -> None:
+        if self._expert_layout_window is None:
+            return
+        from verl.workers.rollout.vllm_rollout.moe_online_update import close_expert_layout_window
+
+        close_expert_layout_window(self._expert_layout_window)
+        self._expert_layout_window = None
+
+    def shutdown(self) -> None:
+        super().shutdown()
+        if self._expert_layout_window is not None:
+            from verl.workers.rollout.vllm_rollout.moe_online_update import close_expert_layout_window
+
+            try:
+                close_expert_layout_window(self._expert_layout_window)
+            except BaseException:
+                logger.exception("best-effort expert layout restore during shutdown failed")
+            self._expert_layout_window = None
 
 
 def register_verl_delta_hccl_weight_transfer_engine() -> None:

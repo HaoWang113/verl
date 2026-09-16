@@ -1104,6 +1104,7 @@ class vLLMHttpServer:
                 VERL_DELTA_WEIGHT_TRANSFER_BACKEND,
                 is_moe_model,
                 require_vllm_delta_support,
+                resolve_moe_delta_settings,
             )
 
             require_vllm_delta_support()
@@ -1129,19 +1130,13 @@ class vLLMHttpServer:
                 )
 
             if is_moe_model(self.model_config.hf_config):
-                if is_torch_npu_available(check_device=False):
-                    raise NotImplementedError(
-                        "delta_sharded with vLLM does not support MoE models on Ascend NPU yet: NPU has no "
-                        "Triton, and the vllm-ascend MoE kernel path is Phase 2 scope; use a dense model"
-                    )
-                moe_backend = engine_kwargs.get("moe_backend")
-                if moe_backend not in {None, "auto", "triton"}:
-                    raise NotImplementedError(
-                        f"delta_sharded with vLLM MoE requires moe_backend='triton'; got {moe_backend!r}"
-                    )
-                engine_kwargs["moe_backend"] = "triton"
-                if engine_kwargs.get("enable_eplb", False):
-                    raise NotImplementedError("delta_sharded with vLLM MoE does not support EPLB")
+                forced_moe_backend = resolve_moe_delta_settings(
+                    is_npu=is_torch_npu_available(check_device=False),
+                    moe_backend=engine_kwargs.get("moe_backend"),
+                    enable_eplb=bool(engine_kwargs.get("enable_eplb", False)),
+                )
+                if forced_moe_backend is not None:
+                    engine_kwargs["moe_backend"] = forced_moe_backend
 
             weight_transfer_config = engine_kwargs.get("weight_transfer_config")
             if weight_transfer_config is None:

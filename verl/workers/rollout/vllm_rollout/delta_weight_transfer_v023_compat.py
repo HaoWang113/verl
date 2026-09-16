@@ -167,6 +167,7 @@ class VerlDeltaIPCWeightTransferEngineV023(VerlDeltaIPCWeightTransferEngine):
         self.model_config = None
         self._session_encoding = None
         self._update_failed = False
+        self._sparse_session_begun = False
 
     def hydrate_v023(self, *, vllm_config, device) -> None:
         """Provide the context a #44353 host would pass at construction."""
@@ -199,6 +200,7 @@ class VerlDeltaHCCLWeightTransferEngineV023(
         self._manifest_sub = None
         self._comm = None
         self._group_rank = None
+        self._expert_layout_window = None
 
 
 def _verl_delta_engine(worker):
