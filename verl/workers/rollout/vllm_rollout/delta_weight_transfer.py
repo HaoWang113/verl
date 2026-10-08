@@ -322,7 +322,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         try:
             moe_before = [(n, t.shape) for n, t in named_tensors if "w13" in n or "w2" in n or "expert" in n.lower()][:4]
             if moe_before:
-                logger.info("[FIX-DIAG] _apply_dense_buckets BEFORE load_weights: %s", moe_before)
+                logger.warning("[FIX-DIAG] _apply_dense_buckets BEFORE load_weights: %s", moe_before)
         except Exception:
             pass
         # [DIAG-DENSE 2026-10-08] Dense seed path (v=0) -- dump name+shape of the
@@ -340,10 +340,9 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         # difference between the two paths without a debugger attached.
         try:
             _dense_shapes = [(n, tuple(t.shape)) for n, t in named_tensors[:16]]
-            print(
-                f"[DIAG-DENSE _apply_dense_buckets] n_tensors={len(named_tensors)} "
-                f"first={_dense_shapes}",
-                flush=True,
+            logger.warning(
+                "[DIAG-DENSE _apply_dense_buckets] n_tensors=%d first=%s",
+                len(named_tensors), _dense_shapes,
             )
         except Exception:
             pass
@@ -357,9 +356,9 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 if any(k in n.lower() for k in ("gate_up_proj", "down_proj", "w13_weight", "w2_weight", "expert"))
             ][:8]
             if _dense_expert:
-                print(
-                    f"[DIAG-DENSE-EXPERT _apply_dense_buckets] expert_tensors={_dense_expert}",
-                    flush=True,
+                logger.warning(
+                    "[DIAG-DENSE-EXPERT _apply_dense_buckets] expert_tensors=%s",
+                    _dense_expert,
                 )
         except Exception:
             pass
@@ -372,7 +371,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                     if len(moe_after) >= 4:
                         break
             if moe_after:
-                logger.info("[FIX-DIAG] _apply_dense_buckets AFTER load_weights: %s", moe_after)
+                logger.warning("[FIX-DIAG] _apply_dense_buckets AFTER load_weights: %s", moe_after)
         except Exception:
             pass
 
@@ -404,10 +403,9 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 )
                 for p in patches[:16]
             ]
-            print(
-                f"[DIAG-DELTA _decode_and_apply] encoding={encoding} "
-                f"n_patches={len(patches)} first={_delta_patches}",
-                flush=True,
+            logger.warning(
+                "[DIAG-DELTA _decode_and_apply] encoding=%s n_patches=%d first=%s",
+                encoding, len(patches), _delta_patches,
             )
         except Exception:
             pass
@@ -434,13 +432,40 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             )
 
         _, load_checkpoint_weight_patches = _checkpoint_patch_api()
-        # The trusted producer emits every changed position at most once;
-        # skip vLLM's sort-based duplicate check on the rollout GPU.
-        load_checkpoint_weight_patches(
-            self.model,
-            patches,
-            validate_unique_indices=False,
-        )
+        # Sparse per-expert MoE patches bypass model.load_weights: the fused-expert
+        # loader (qwen3_5.py:load_fused_expert_weights) assumes 3D-stacked [E,2N,K]
+        # tensors and the mapper maps per-expert names back to fused names, so a
+        # per-expert 2D [N,K] patch crashes in copy_non_nan_ (dest (512,2048) !=
+        # src (2048,)). apply_expert_patch_direct writes them into the
+        # checkpoint-layout live parameters (the sparse window already flipped
+        # them), bypassing the fused loader. Non-expert patches go through the
+        # normal loader path.
+        from verl.workers.rollout.vllm_rollout.moe_online_update import apply_expert_patch_direct
+
+        remaining_patches = []
+        n_expert_applied = 0
+        for patch in patches:
+            applied = apply_expert_patch_direct(
+                self.model, patch.name, patch.shape, patch.dtype, patch.values, patch.indices
+            )
+            if applied:
+                n_expert_applied += 1
+            else:
+                remaining_patches.append(patch)
+        if n_expert_applied:
+            logger.warning(
+                "delta: applied %d per-expert patches via direct-write, %d via load_checkpoint_weight_patches",
+                n_expert_applied,
+                len(remaining_patches),
+            )
+        if remaining_patches:
+            # The trusted producer emits every changed position at most once;
+            # skip vLLM's sort-based duplicate check on the rollout GPU.
+            load_checkpoint_weight_patches(
+                self.model,
+                remaining_patches,
+                validate_unique_indices=False,
+            )
 
     def _assert_dense_session_supported(self) -> None:
         """Dense flushes lean on vLLM's layerwise reload, which copies reloaded
@@ -519,9 +544,9 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 from vllm.model_executor.model_loader.utils import (
                     process_weights_after_loading,
                 )
-                logger.info("[FIX-DIAG] dense_buckets finish_weight_update: calling process_weights_after_loading to restore checkpoint layout")
+                logger.warning("[FIX-DIAG] dense_buckets finish_weight_update: calling process_weights_after_loading to restore checkpoint layout")
                 process_weights_after_loading(self.model, self.model_config, self.device)
-                logger.info("[FIX-DIAG] dense_buckets finish_weight_update: process_weights_after_loading done")
+                logger.warning("[FIX-DIAG] dense_buckets finish_weight_update: process_weights_after_loading done")
             except BaseException:
                 self._update_failed = True
                 raise

@@ -11,11 +11,14 @@ custom-write loaders are unsupported.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Iterable
 from typing import NamedTuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_PATCH_CHUNK_BYTES = 512 << 20
 
@@ -69,10 +72,9 @@ def _load_nan_masked_weights(
         for n, _t in _patch_shapes:
             p = _params.get(n)
             _param_shapes.append((n, None if p is None else tuple(p.shape)))
-        print(
-            f'[DIAG _load_nan_masked_weights] n_patches={len(weights)} '
-            f'first_patch_shapes={_patch_shapes} param_shapes={_param_shapes}',
-            flush=True,
+        logger.warning(
+            '[DIAG _load_nan_masked_weights] n_patches=%d first_patch_shapes=%s param_shapes=%s',
+            len(weights), _patch_shapes, _param_shapes,
         )
     except Exception:
         pass
@@ -92,9 +94,9 @@ def _load_nan_masked_weights(
                 if len(_expert_patches) >= 8:
                     break
         if _expert_patches:
-            print(
-                f'[DIAG-EXPERT _load_nan_masked_weights] expert_patches={_expert_patches}',
-                flush=True,
+            logger.warning(
+                '[DIAG-EXPERT _load_nan_masked_weights] expert_patches=%s',
+                _expert_patches,
             )
     except Exception:
         pass
@@ -113,8 +115,13 @@ def _load_nan_masked_weights(
         ):
             import traceback as _tb
             _stack = ''.join(_tb.format_stack()[-10:])
-            print(f'[DEBUG copy_non_nan_ FAIL] dest dtype={destination.dtype} shape={tuple(destination.shape)} is_fp={destination.is_floating_point()} | src dtype={source.dtype} shape={tuple(source.shape)} is_fp={source.is_floating_point()} | shapes_match={destination.shape == source.shape}', flush=True)
-            print(f'[DEBUG stack]:\n{_stack}', flush=True)
+            logger.warning(
+                '[DEBUG copy_non_nan_ FAIL] dest dtype=%s shape=%s is_fp=%s | src dtype=%s shape=%s is_fp=%s | shapes_match=%s',
+                destination.dtype, tuple(destination.shape), destination.is_floating_point(),
+                source.dtype, tuple(source.shape), source.is_floating_point(),
+                destination.shape == source.shape,
+            )
+            logger.warning('[DEBUG stack]:\n%s', _stack)
             raise NotImplementedError(
                 "Sparse checkpoint patches require a same-shaped "
                 "floating-point final copy"

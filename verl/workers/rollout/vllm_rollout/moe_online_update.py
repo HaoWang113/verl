@@ -226,7 +226,7 @@ def prepare_expert_weights_for_online_update(layer: torch.nn.Module, window: Exp
     # and the shape mismatch surfaces downstream. Pair with [DIAG] (apply entry)
     # to confirm the live param shape matches the patch shape when the apply runs.
     try:
-        logger.info(
+        logger.warning(
             "[DIAG-WINDOW prepare] layer=%s w13 runtime=%s -> ckpt=%s | w2 runtime=%s -> ckpt=%s",
             type(layer).__name__,
             tuple(w13.shape), tuple(w13.transpose(1, 2).shape),
@@ -266,7 +266,7 @@ def open_expert_layout_window(model: torch.nn.Module) -> ExpertLayoutWindow | No
     if not modules:
         return None
     host_module = assert_online_update_fingerprint()
-    logger.info(
+    logger.warning(
         "sparse delta: opening MoE layout window over %d expert module(s) (host shape %s)",
         len(modules),
         host_module,
@@ -282,3 +282,135 @@ def close_expert_layout_window(window: ExpertLayoutWindow) -> None:
     for layer in window.flipped_layers:
         restore_expert_weights_after_online_update(layer)
     window.flipped_layers.clear()
+
+
+# ---- per-expert direct-apply (bypass model.load_weights fused-expert loader) ----
+# The fused-expert loader (e.g. qwen3_5.py:load_fused_expert_weights) loops
+# ``for expert_id in range(num_experts): curr = loaded_weight[expert_id]`` and
+# assumes loaded_weight is 3D-stacked [E,2N,K] (expert_id from dim 0, NOT from
+# the name). Dense seed (v=0) lands a whole layer's experts in one
+# model.load_weights call, so AutoWeightsLoader groups+stacks them into 3D and
+# the fused loader slices correctly. Sparse delta (v>=1) ships per-expert 2D
+# [N,K] patches per flush; the mapper maps the per-expert name back to the
+# fused name, but the 2D tensor cannot be stacked -> the fused loader slices a
+# 1D row -> copy_non_nan_ shape mismatch (dest (512,2048) != src (2048,)).
+# This path writes per-expert patches directly into the checkpoint-layout live
+# parameters (the sparse window already flipped them to [E,2N,K]/[E,K,N]),
+# bypassing the fused loader entirely. TP sharding is derived from the live
+# parameter shape vs the patch shape, so no vllm_config plumbing is needed.
+
+_EXPERT_PATCH_RE = None
+
+
+def _expert_patch_name_regex():
+    global _EXPERT_PATCH_RE
+    if _EXPERT_PATCH_RE is None:
+        import re
+
+        _EXPERT_PATCH_RE = re.compile(
+            r"^(?P<layer>.+\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)(?:\.weight)?$"
+        )
+    return _EXPERT_PATCH_RE
+
+
+def parse_expert_patch_name(name: str):
+    """Return ``(layer_prefix, expert_id, proj)`` for a per-expert HF checkpoint
+    name, or ``None`` if the name is not a per-expert MoE checkpoint name."""
+    m = _expert_patch_name_regex().match(name)
+    if m is None:
+        return None
+    return m.group("layer"), int(m.group("eid")), m.group("proj")
+
+
+def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, values, indices) -> bool:
+    """Apply one sparse per-expert patch directly into the checkpoint-layout live
+    parameter, bypassing ``model.load_weights``. Returns ``True`` if the patch
+    was applied here, ``False`` if it is not a per-expert patch (caller should
+    fall back to the normal loader path).
+
+    The sparse window must already be open (parameters at checkpoint layout):
+    ``w13_weight`` = [E, 2N, K], ``w2_weight`` = [E, K, N] (TP-narrowed). The
+    patch carries per-expert checkpoint coordinates: ``shape`` = [N, K] (gate/up)
+    or [K, N] (down), ``indices`` = int32 flat positions into ``shape``, ``values``
+    = the changed elements. We densify into a NaN-masked [N,K]/[K,N] tensor,
+    TP-narrow it to match the live parameter's per-expert slot, then NaN-masked
+    copy into ``w13_weight[e, slot, :]`` / ``w2_weight[e]``."""
+    parsed = parse_expert_patch_name(name)
+    if parsed is None:
+        return False
+    layer_prefix, expert_id, proj = parsed
+
+    # Find the fused-expert module matching this layer_prefix. ``layer_prefix``
+    # is e.g. "model.layers.0.mlp.experts"; the FusedMoE module is the one whose
+    # qualname equals layer_prefix (or starts with it under base_layer wrapping).
+    target_module = None
+    for mod_qualname, module in model.named_modules():
+        if mod_qualname == layer_prefix or mod_qualname.startswith(layer_prefix + "."):
+            if getattr(module, "w13_weight", None) is not None or getattr(module, "w13_weight_list", None) is not None:
+                target_module = module
+                break
+    if target_module is None:
+        return False
+    w13 = getattr(target_module, "w13_weight", None)
+    w2 = getattr(target_module, "w2_weight", None)
+    if w13 is None or w2 is None:
+        return False
+
+    # EP: map the global expert_id to the local physical id. If this expert is
+    # not on this rank (EP-sharded), skip it (the HCCL broadcast reaches every
+    # worker but each worker only owns its local experts).
+    expert_map_manager = getattr(target_module, "expert_map_manager", None)
+    if expert_map_manager is not None:
+        local_expert_id = expert_map_manager.map_global_to_local(expert_id)
+        if local_expert_id == -1:
+            return True  # not local; nothing to write on this rank
+        expert_id = local_expert_id
+
+    import math
+
+    numel = int(math.prod(shape))
+    # Densify: full [N,K]/[K,N] checkpoint tensor, NaN at unchanged positions.
+    flat = torch.full((numel,), float("nan"), dtype=dtype, device=values.device)
+    if indices is not None and int(indices.numel()):
+        flat.index_copy_(
+            0,
+            indices.to(device=flat.device, dtype=torch.long),
+            values.to(dtype=dtype, device=flat.device),
+        )
+    elif indices is None and int(values.numel()):
+        # dense patch (full coverage): values already fill the whole tensor
+        flat = values.to(dtype=dtype, device=flat.device)
+    checkpoint_tensor = flat.view(shape)
+
+    # w13 checkpoint layout [E, 2N, K]: gate_proj (w1) -> [e, :N, :], up_proj (w3)
+    # -> [e, N:, :]; w2 checkpoint layout [E, K, N]: down_proj -> [e, :, :].
+    # The live parameter is already TP-sharded, so select the per-expert slot
+    # FIRST and then narrow the densified checkpoint tensor to that slot's shape
+    # (the slot's shape encodes the TP shard: 2N->2N/TP, K->K/TP, N->N/TP).
+    if proj == "gate_proj":
+        slot_full_n = w13.shape[1] // 2
+        dest = w13.data[expert_id, :slot_full_n, :]
+    elif proj == "up_proj":
+        slot_full_n = w13.shape[1] // 2
+        dest = w13.data[expert_id, slot_full_n:, :]
+    else:  # down_proj
+        dest = w2.data[expert_id]
+
+    # Narrow the densified checkpoint tensor to the live slot's per-rank shape.
+    # checkpoint_tensor dims (before TP): gate/up [N_full, K_full], down [K_full, N_full].
+    # dest dims (after TP): gate/up [N_full/TP, K_full/TP], down [K_full/TP, N_full/TP].
+    # Each dim where checkpoint_tensor is larger than dest is a TP-sharded dim;
+    # pick this rank's slice using the module's tp_rank.
+    tp_rank = getattr(target_module, "tp_rank", 0)
+    src = checkpoint_tensor
+    for d in range(src.ndim):
+        if src.shape[d] > dest.shape[d]:
+            per_rank = dest.shape[d]
+            start = per_rank * tp_rank
+            src = src.narrow(d, start, per_rank)
+    src = src.to(dtype=dest.dtype, device=dest.device)
+    if dest.shape != src.shape:
+        return False
+
+    torch.where(torch.isnan(src), dest, src, out=dest)
+    return True
