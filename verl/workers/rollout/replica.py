@@ -199,10 +199,14 @@ class RolloutReplica(ABC):
         resource_pool_spec = {
             resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
         }
+        # Use rollout-specific accelerator_type (e.g., "rollout_node") to pin
+        # standalone rollout servers to designated inference nodes.
+        rollout_accelerator_type = getattr(self.config, "accelerator_type", None)
         resource_pool_manager = ResourcePoolManager(
             resource_pool_spec=resource_pool_spec,
             mapping=None,
             max_colocate_count=2,
+            accelerator_type=rollout_accelerator_type,
         )
         resource_pool_manager.create_resource_pool()
         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]

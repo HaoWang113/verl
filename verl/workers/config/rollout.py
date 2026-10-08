@@ -160,6 +160,11 @@ class RolloutConfig(BaseConfig):
     nnodes: int = 0
     n_gpus_per_node: int = 8
 
+    # Accelerator type (custom Ray resource) to restrict standalone rollout placement groups
+    # to specific node types. Set to a custom resource name (e.g., "rollout_node") that is
+    # registered on target Ray nodes via `ray start --resources='{"rollout_node": 100}'`.
+    # null means no restriction.
+    accelerator_type: Optional[str] = None
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0

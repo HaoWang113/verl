@@ -492,10 +492,17 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
-                selected_tensors = [tensor_lst[idx] for idx in indices]
+                ragged_idx = getattr(tensor, "_ragged_idx", tensor.dim() - 1)
+                cat_dim = ragged_idx - 1
+                vals = tensor.values()
+                offs = tensor.offsets()
+                selected_tensors = []
+                for idx in indices.tolist():
+                    start = offs[idx].item()
+                    length = (offs[idx + 1] - offs[idx]).item()
+                    selected_tensors.append(vals.narrow(cat_dim, start, length))
                 data_dict[key] = nested_tensor_from_tensor_list(
-                    selected_tensors, ragged_idx=getattr(tensor, "_ragged_idx", tensor.dim() - 1)
+                    selected_tensors, ragged_idx=ragged_idx
                 )
             else:
                 # This handles NonTensorStack (indexable by batch dim) and NonTensorData (scalar metadata).

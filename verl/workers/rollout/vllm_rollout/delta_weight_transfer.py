@@ -298,6 +298,46 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             raise callback_error
         return payload
 
+    def _apply_dense_buckets(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
+        """Apply one dense seed bucket through the model's weight_loader path.
+
+        The dense-bucket seed reuses the dense checkpoint engine's transport,
+        whose tensors are final model parameters: ``load_weights`` routes each
+        through the per-parameter ``weight_loader``, which owns the runtime
+        layout (including the Ascend fused-expert transpose) -- the same apply
+        mechanism the sparse patches use, NOT the layerwise reload that cannot
+        replay that transform (``_assert_dense_session_supported``)."""
+        if self._session_encoding is None:
+            self._session_encoding = "dense_buckets"
+        elif self._session_encoding != "dense_buckets":
+            raise ValueError(
+                "One weight update cannot mix dense-bucket and DeltaFlush payloads "
+                f"({self._session_encoding!r} then dense_buckets)"
+            )
+        # [FIX 2026-10-06] Log MoE expert weight shapes before/after load_weights
+        # to diagnose aclnnGroupedMatmulV5 161002 K-dim mismatch (2048 vs 1024).
+        # Root cause: delta_sharded DENSE-SEED loads checkpoint-layout weights into
+        # runtime-layout (already transposed) params without re-running
+        # process_weights_after_loading to restore checkpoint layout.
+        try:
+            moe_before = [(n, t.shape) for n, t in named_tensors if "w13" in n or "w2" in n or "expert" in n.lower()][:4]
+            if moe_before:
+                logger.info("[FIX-DIAG] _apply_dense_buckets BEFORE load_weights: %s", moe_before)
+        except Exception:
+            pass
+        self.model.load_weights(named_tensors)
+        try:
+            moe_after = []
+            for name, param in self.model.named_parameters():
+                if "w13" in name or "w2" in name or "expert" in name.lower():
+                    moe_after.append((name, tuple(param.shape)))
+                    if len(moe_after) >= 4:
+                        break
+            if moe_after:
+                logger.info("[FIX-DIAG] _apply_dense_buckets AFTER load_weights: %s", moe_after)
+        except Exception:
+            pass
+
     def _decode_and_apply(self, payload: list[tuple[str, torch.Tensor]]) -> None:
         """Decode one flush's named tensors into checkpoint patches and apply them."""
         encoding, patches = decode_delta_payload(payload)
@@ -399,6 +439,22 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 # Exactly one end attempt: never re-enter a partially restored
                 # model; the poisoned-worker contract takes over.
                 self._sparse_session_begun = False
+        elif self._session_encoding == "dense_buckets":
+            # [FIX 2026-10-06] Re-run process_weights_after_loading to align with
+            # nccl baseline (utils.py:382-385). Without this, MoE expert weights
+            # stay in checkpoint layout loaded into runtime-layout (transposed)
+            # params, causing double-transpose and K-dim mismatch (2048 vs 1024)
+            # in aclnnGroupedMatmulV5 (error 161002 ACLNN_ERR_PARAM_INVALID).
+            try:
+                from vllm.model_executor.model_loader.utils import (
+                    process_weights_after_loading,
+                )
+                logger.info("[FIX-DIAG] dense_buckets finish_weight_update: calling process_weights_after_loading to restore checkpoint layout")
+                process_weights_after_loading(self.model, self.model_config, self.device)
+                logger.info("[FIX-DIAG] dense_buckets finish_weight_update: process_weights_after_loading done")
+            except BaseException:
+                self._update_failed = True
+                raise
         self._session_encoding = None
 
     def shutdown(self) -> None:
@@ -535,7 +591,12 @@ class VerlDeltaHCCLWeightTransferEngine(VerlDeltaIPCWeightTransferEngine):
         try:
             sub, comm = self._ensure_channel(update_info.group_rank)
             pump_hccl_delta_session(
-                sub, comm, self.device, on_flush=self._decode_and_apply, group_rank=update_info.group_rank
+                sub,
+                comm,
+                self.device,
+                on_flush=self._decode_and_apply,
+                group_rank=update_info.group_rank,
+                on_dense_buckets=self._apply_dense_buckets,
             )
         except BaseException:
             # A dropped receiver would otherwise hang the whole group forever:

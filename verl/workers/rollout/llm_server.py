@@ -339,7 +339,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
-        final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
+        final_output.extra_fields["num_cached_tokens"] = num_cached_tokens if num_cached_tokens is not None else 0
         return final_output
 
 

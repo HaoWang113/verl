@@ -42,19 +42,20 @@ import json
 import logging
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 
 import torch
+import zmq
 
 from verl.utils.device import is_torch_npu_available
 
 if not is_torch_npu_available(check_device=False):
     raise ImportError("DeltaHCCLCheckpointEngine is unavailable because the torch.npu module is not available.")
 
-from .base import CheckpointEngineRegistry
+from .base import CheckpointEngineRegistry, split_weight_chunks
 from .delta_sync.hccl_receiver import SLOW_FLUSH_SECONDS, wait_delta_wire_ready
 from .delta_sync.pipeline import DeltaSyncMixin
-from .hccl_checkpoint_engine import HCCLCheckpointEngine, MasterMetadata
+from .hccl_checkpoint_engine import BroadcastOperation, HCCLCheckpointEngine, MasterMetadata
 from verl.utils.distributed import stateless_init_process_group
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,125 @@ class DeltaHCCLCheckpointEngine(DeltaSyncMixin, HCCLCheckpointEngine):
         self._ensure_communicator()
 
     # ---- trainer side transport ----
+    @torch.no_grad()
+    async def _send_dense_bucket_seed(
+        self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int | None = None
+    ) -> dict[str, float] | None:
+        """Stream the full export over the dense engine's bucket protocol.
+
+        The indices seed ships ~3x the wire bytes and runs a strictly serial
+        per-flush loop (assemble -> broadcast -> full-device synchronize, fresh
+        multi-GB buffers every flush); on the 35B MoE E2E that made the first
+        sync ~45x slower than the dense HCCL engine on the same job (1874.7s vs
+        41.4s). This seed instead reuses the dense engine's proven pipeline
+        verbatim -- ``split_weight_chunks`` + double-buffered
+        ``BroadcastOperation`` over THIS engine's group -- and the receiver
+        applies complete tensors through ``model.load_weights`` (the
+        weight_loader path the sparse patches already use), so the NPU MoE
+        runtime layout is handled by vLLM itself instead of by the layerwise
+        reload that crashed there (2026-09-17). Steady syncs keep the indices
+        flush wire; the values-only flush stays reserved for the verify sweep.
+        """
+        assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
+        if self.rank < 0:
+            # Every trainer rank iterates the generator (the per-tensor
+            # assembly is collective); only rank 0 ships.
+            for _name, _tensor in weights:
+                pass
+            return None
+
+        t0 = time.time()
+        self._ensure_wire()
+        # One session-opening manifest routes the receivers' pumps to the
+        # bucket loop; the buckets then follow the dense engine's wire format.
+        self.socket.send_string(self.topic, flags=zmq.SNDMORE)
+        self.socket.send_pyobj(
+            {
+                "kind": "dense_seed",
+                "is_full": True,
+                "encoding": "dense_buckets",
+                "is_last": False,
+                "terminal_empty": False,
+                "bucket_size": int(self.bucket_size),
+            }
+        )
+
+        send_buf = torch.empty(self.bucket_size, dtype=torch.uint8, device=self._wire_device)
+        recv_buf = torch.empty_like(send_buf)
+        broadcast_op = None
+        bucket_meta: dict = {}
+        offset = 0
+        n_buckets = 0
+        total_elems = 0
+        wire_bytes = 0
+        try:
+            async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
+                if offset + tensor_meta.chunk_size > self.bucket_size:
+                    torch.npu.synchronize()
+                    if broadcast_op is not None:
+                        await broadcast_op.wait_for_complete()
+                    broadcast_op = BroadcastOperation(
+                        rank=self.rank,
+                        process_group=self._comm,
+                        bucket=send_buf,
+                        metadata={"kind": "dense_bucket", "bucket_meta": bucket_meta, "is_last": False},
+                        socket=self.socket,
+                        topic=self.topic,
+                    )
+                    n_buckets += 1
+                    # swap send_buf and recv_buf: fill the spare while the
+                    # previous bucket is still on the wire
+                    send_buf, recv_buf = recv_buf, send_buf
+                    bucket_meta = {}
+                    offset = 0
+                assert offset + tensor_meta.chunk_size <= self.bucket_size
+                assert tensor_meta.name not in bucket_meta
+                tensor_meta.offset = offset
+                bucket_meta[tensor_meta.name] = tensor_meta
+                send_buf[offset : offset + tensor_meta.chunk_size] = chunk
+                offset += tensor_meta.chunk_size
+                total_elems += int(tensor_meta.chunk_size) // tensor_meta.dtype.itemsize
+                wire_bytes += int(tensor_meta.chunk_size)
+
+            torch.npu.synchronize()
+            if broadcast_op is not None:
+                await broadcast_op.wait_for_complete()
+            broadcast_op = BroadcastOperation(
+                rank=self.rank,
+                process_group=self._comm,
+                bucket=send_buf,
+                metadata={"kind": "dense_bucket", "bucket_meta": bucket_meta, "is_last": True},
+                socket=self.socket,
+                topic=self.topic,
+            )
+            n_buckets += 1
+            await broadcast_op.wait_for_complete()
+            # wait_for_complete only waits for the HCCL kernel to be enqueued;
+            # synchronize so the buffers do not go out of scope mid-flight.
+            torch.npu.synchronize()
+        finally:
+            del send_buf, recv_buf, broadcast_op
+            self._release_after_round("seed")
+
+        elapsed = time.time() - t0
+        logger.warning(
+            "delta-sharded FULL-SEED(dense_buckets) v=%s done in %.1fs (buckets=%d elems=%d wire=%.1fGB)",
+            global_steps,
+            elapsed,
+            n_buckets,
+            total_elems,
+            wire_bytes / (1 << 30),
+        )
+        if not total_elems:
+            return None
+        return {
+            "checkpoint_engine/changed_ratio": 1.0,
+            "checkpoint_engine/changed_elems": float(total_elems),
+            "checkpoint_engine/payload_mbytes": wire_bytes / (1 << 20),
+            "checkpoint_engine/flushes": float(n_buckets),
+            "checkpoint_engine/elapsed_seconds": elapsed,
+        }
+
     async def send_weights(self, engine, global_steps: int | None = None):
         """Reset the per-session flush counter, then run the delta pipeline;
         on failure abort the HCCL group so the receivers fail fast instead of

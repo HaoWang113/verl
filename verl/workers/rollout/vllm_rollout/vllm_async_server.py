@@ -717,7 +717,7 @@ class vLLMHttpServer:
                     self._admitting -= 1
             assert final_res is not None
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": self.global_steps, "num_cached_tokens": 0}
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".

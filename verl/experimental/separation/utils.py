@@ -56,7 +56,10 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         assert rm_cfg.n_gpus_per_node > 0, "config.reward.reward_model.n_gpus_per_node must be greater than 0"
         assert rm_cfg.nnodes > 0, "config.reward.reward_model.nnodes must be greater than 0"
 
-    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    accelerator_type = config.trainer.get("accelerator_type", None) if hasattr(config.trainer, "get") else None
+    import logging
+
+    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping, accelerator_type=accelerator_type)
 
 
 def create_role_worker_mapping(config):

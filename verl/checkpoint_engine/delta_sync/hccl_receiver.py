@@ -120,21 +120,113 @@ def wait_delta_wire_ready(store, num_receivers: int, timeout: float = WIRE_READY
             time.sleep(0.25)
 
 
+def _collect_bucket_tensors(
+    buf: torch.Tensor, bucket_meta: dict, merging: dict, bucket_size: int
+) -> list[tuple[str, torch.Tensor]]:
+    """Materialize complete tensors from one received dense bucket.
+
+    Mirrors ``merge_weight_chunks``: tensors that fit in one bucket become views
+    into the receive buffer (valid until that buffer is reused two swaps later
+    -- the caller must apply before the next broadcast lands), oversized
+    tensors accumulate into private storage keyed by name."""
+    out: list[tuple[str, torch.Tensor]] = []
+    for tm in bucket_meta.values():
+        nbytes = int(tm.shape.numel()) * tm.dtype.itemsize
+        chunk = buf[tm.offset : tm.offset + tm.chunk_size]
+        if nbytes <= bucket_size:
+            assert tm.chunk_offset == 0, f"{tm.name}: mid-tensor chunk for a bucket-sized tensor"
+            out.append((tm.name, chunk.view(tm.dtype).view(tuple(tm.shape))))
+            continue
+        entry = merging.get(tm.name)
+        if entry is None:
+            assert tm.chunk_offset == 0, f"{tm.name}: first chunk at offset {tm.chunk_offset} != 0"
+            entry = merging[tm.name] = [torch.empty(nbytes, dtype=torch.uint8, device=buf.device), 0]
+        flat, next_off = entry
+        assert next_off == tm.chunk_offset, f"{tm.name}: chunk gap, expected offset {next_off}, got {tm.chunk_offset}"
+        flat[tm.chunk_offset : tm.chunk_offset + tm.chunk_size] = chunk
+        entry[1] = tm.chunk_offset + tm.chunk_size
+        if tm.chunk_offset + tm.chunk_size == nbytes:
+            out.append((tm.name, flat.view(tm.dtype).view(tuple(tm.shape))))
+            del merging[tm.name]
+    return out
+
+
+def _pump_dense_seed_buckets(
+    sub: zmq.Socket,
+    comm,
+    device,
+    bucket_size: int,
+    on_buckets: Callable[[list[tuple[str, torch.Tensor]]], None],
+    rank_tag: str,
+) -> None:
+    """Consume one ``dense_seed`` session: the dense checkpoint engine's bucket
+    protocol carried over this group (the session-opening manifest was already
+    consumed by the caller). Each round receives one bucket-metadata message,
+    broadcasts the bucket buffer, then hands the complete tensors to
+    ``on_buckets`` -- which must apply them before returning (they view the
+    receive buffer)."""
+    synchronize = getattr(torch, device.type).synchronize
+    t0 = time.monotonic()
+    send_buf = torch.empty(bucket_size, dtype=torch.uint8, device=device)
+    recv_buf = torch.empty_like(send_buf)
+    merging: dict = {}
+    n_buckets = 0
+    n_tensors = 0
+    try:
+        while True:
+            if sub.poll(int(MANIFEST_RECV_TIMEOUT_SECONDS * 1000)) == 0:
+                raise TimeoutError(
+                    f"dense seed: no bucket metadata within {MANIFEST_RECV_TIMEOUT_SECONDS:.0f}s "
+                    f"(buckets={n_buckets}); sender stalled mid-seed or exited without destroying the group"
+                )
+            sub.recv_string()
+            bmeta = sub.recv_pyobj()
+            comm.broadcast(recv_buf, src=0)
+            synchronize()
+            # swap: read the bucket just received from send_buf while the next
+            # broadcast lands in recv_buf (stream ordering keeps the views of
+            # the previous bucket valid through ``on_buckets``)
+            send_buf, recv_buf = recv_buf, send_buf
+            n_buckets += 1
+            named = _collect_bucket_tensors(send_buf, bmeta["bucket_meta"], merging, bucket_size)
+            if named:
+                on_buckets(named)
+                n_tensors += len(named)
+            if bmeta.get("is_last"):
+                break
+    finally:
+        del send_buf, recv_buf
+    assert not merging, f"dense seed ended with incomplete tensors: {sorted(merging)}"
+    logger.warning(
+        "delta-hccl pump rank=%s DENSE-SEED done in %.1fs (buckets=%d tensors=%d)",
+        rank_tag,
+        time.monotonic() - t0,
+        n_buckets,
+        n_tensors,
+    )
+
+
 def pump_hccl_delta_session(
     sub: zmq.Socket,
     comm,
     device,
     on_flush: Callable[[list[tuple[str, torch.Tensor]]], None],
     group_rank: int | None = None,
+    on_dense_buckets: Callable[[list[tuple[str, torch.Tensor]]], None] | None = None,
 ) -> str:
     """Pull one delta session (manifests + broadcast payloads) and hand each
     flush to ``on_flush(named_tensors)``.
 
-    Returns the session's wire encoding (``"dense"`` | ``"indices"``); a
-    terminal-only session (steady sync with zero changes) returns
-    ``"indices"`` with zero ``on_flush`` calls. The device synchronize after
-    each flush's broadcasts mirrors the sender: PyHccl enqueues on the current
-    stream, so the received buffers must not be read before completion.
+    A session whose opening manifest carries ``kind == "dense_seed"`` instead
+    carries the dense engine's bucket protocol; its complete tensors go to
+    ``on_dense_buckets`` (fail loud when the adapter does not provide one).
+
+    Returns the session's wire encoding (``"dense"`` | ``"indices"`` |
+    ``"dense_buckets"``); a terminal-only session (steady sync with zero
+    changes) returns ``"indices"`` with zero ``on_flush`` calls. The device
+    synchronize after each flush's broadcasts mirrors the sender: PyHccl
+    enqueues on the current stream, so the received buffers must not be read
+    before completion.
 
     Every flush emits one WARNING line tagged with ``group_rank`` and its
     session-local sequence number, plus broadcast/apply timings: at default
@@ -155,6 +247,14 @@ def pump_hccl_delta_session(
                 )
             sub.recv_string()
             meta = sub.recv_pyobj()
+            if meta.get("kind") == "dense_seed":
+                if on_dense_buckets is None:
+                    raise NotImplementedError(
+                        "sender opened a dense_seed session but this receiver has no dense-bucket consumer"
+                    )
+                _pump_dense_seed_buckets(sub, comm, device, int(meta["bucket_size"]), on_dense_buckets, rank_tag)
+                logger.warning("delta-hccl pump rank=%s session END (dense seed)", rank_tag)
+                return "dense_buckets"
             if meta.get("terminal_empty"):
                 logger.warning("delta-hccl pump rank=%s TERMINAL empty after %d flush(es)", rank_tag, flush_seq)
                 break

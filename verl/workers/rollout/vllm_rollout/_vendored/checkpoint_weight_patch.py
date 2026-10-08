@@ -65,6 +65,10 @@ def _load_nan_masked_weights(
             and source.is_floating_point()
             and destination.shape == source.shape
         ):
+            import traceback as _tb
+            _stack = ''.join(_tb.format_stack()[-10:])
+            print(f'[DEBUG copy_non_nan_ FAIL] dest dtype={destination.dtype} shape={tuple(destination.shape)} is_fp={destination.is_floating_point()} | src dtype={source.dtype} shape={tuple(source.shape)} is_fp={source.is_floating_point()} | shapes_match={destination.shape == source.shape}', flush=True)
+            print(f'[DEBUG stack]:\n{_stack}', flush=True)
             raise NotImplementedError(
                 "Sparse checkpoint patches require a same-shaped "
                 "floating-point final copy"

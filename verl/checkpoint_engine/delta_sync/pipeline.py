@@ -214,9 +214,11 @@ class DeltaSyncMixin:
 
     ``send_weights`` takes the TRAINING ENGINE and drives the sync itself: the
     seed (first sync) streams the backend's full ``get_per_tensor_param()``
-    export as full-coverage indices flushes (the receiver's sparse layout window
-    owns the NPU MoE layout contract; the values-only wire cannot) and pins the
-    diff base (``prime_delta_snapshots``); every steady sync consumes the
+    export -- as the transport's dense bucket protocol when the engine provides
+    ``_send_dense_bucket_seed``, else as full-coverage indices flushes (the
+    receiver's sparse layout window owns the NPU MoE layout contract; the
+    values-only wire cannot) -- and pins the diff base
+    (``prime_delta_snapshots``); every steady sync consumes the
     backend's HF delta export ``get_per_tensor_param_delta_shard()`` -- per-parameter
     FINAL-HF-coordinate entries ``(slots, dtype_str, counts, hf_idx, hf_val,
     gather_group)``. Naming, to-HF conversion, diff and snapshot all live on
@@ -595,7 +597,16 @@ class DeltaSyncMixin:
         assert self.rank <= 0, "Trainer workers other than rank 0 should not send weights."
         if not self._shard_seeded:
             full, _ = engine.get_per_tensor_param()
-            metrics = self._send_full_seed(full, global_steps)
+            # A transport that provides ``_send_dense_bucket_seed`` (the HCCL
+            # engine) streams the seed over the dense engine's bucket protocol --
+            # baseline wire speed, applied through the model's weight_loader
+            # instead of the sparse window. Engines without the hook keep the
+            # full-coverage indices seed.
+            hook = getattr(self, "_send_dense_bucket_seed", None)
+            if hook is not None:
+                metrics = await hook(full, global_steps)
+            else:
+                metrics = self._send_full_seed(full, global_steps)
             # weights do not move during the sync, so the snapshots equal exactly
             # what the rollout just received.
             engine.prime_delta_snapshots()

@@ -165,6 +165,9 @@ trainer:
 
   # Number of GPUs per node
   n_gpus_per_node: 8
+  # Accelerator type (custom Ray resource) to restrict placement groups to specific node types.
+  # Set to a custom resource name (e.g., "train_node"). null means no restriction.
+  accelerator_type: null
 
   # Save frequency (by iteration) for model checkpoints
   save_freq: -1
