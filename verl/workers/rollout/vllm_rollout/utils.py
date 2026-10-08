@@ -45,11 +45,22 @@ VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", 
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
+    """Map a vLLM worker's local rank onto the colocated trainer's rollout-local rank.
+
+    The result indexes the per-GPU zmq weight-sync socket and must match the
+    sender side's ``rollout_rank % local_world_size`` (the GPU index within the
+    replica). vLLM assigns devices as ``dp_local * (tp*pp) + in_shard_rank``
+    with in-shard ranks laid out tp-minor; taking ``% (tp*pp)`` is invariant to
+    whether the host already folded the dp offset into ``worker_local_rank``
+    (gpu_worker ``init_device`` mutates ``self.local_rank`` on some hosts).
+    """
     worker_local_rank = int(worker_local_rank)
     if parallel_config is None:
         return worker_local_rank
 
     tp_size = max(int(getattr(parallel_config, "tensor_parallel_size", 1) or 1), 1)
+    pp_size = max(int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1), 1)
+    tp_pp_size = tp_size * pp_size
     dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
     dp_local_size = int(getattr(parallel_config, "data_parallel_size_local", 1) or 1)
     if dp_size <= 1 and dp_local_size <= 1:
@@ -66,8 +77,31 @@ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config
     if dp_local_rank is None:
         return worker_local_rank
 
-    tp_rank = worker_local_rank % tp_size
-    return int(dp_local_rank) * tp_size + tp_rank
+    in_shard_rank = worker_local_rank % tp_pp_size
+    return int(dp_local_rank) * tp_pp_size + in_shard_rank
+
+
+def _assert_weight_sync_rank_matches_groups(resolved_rank: int, parallel_config: Any) -> None:
+    """Fail-loud cross-check of the resolver against the runtime PP/TP groups.
+
+    A silent rank mismatch pairs a worker with the wrong GPU's zmq socket and
+    corrupts weights without any error, so when PP>1 the config-derived
+    in-shard rank must agree with the one reported by the initialized
+    ``torch.distributed`` groups (pp-major/tp-minor layout).
+    """
+    from vllm.distributed import get_pp_group, get_tp_group
+
+    tp_size = max(int(getattr(parallel_config, "tensor_parallel_size", 1) or 1), 1)
+    pp_size = max(int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1), 1)
+    tp_pp_size = tp_size * pp_size
+    group_in_shard_rank = get_pp_group().rank_in_group * tp_size + get_tp_group().rank_in_group
+    if resolved_rank % tp_pp_size != group_in_shard_rank:
+        raise RuntimeError(
+            "vLLM weight-sync rank mismatch: config-derived local rank "
+            f"{resolved_rank} (in-shard {resolved_rank % tp_pp_size}) disagrees with the "
+            f"distributed groups (pp={get_pp_group().rank_in_group}, tp={get_tp_group().rank_in_group} "
+            f"-> in-shard {group_in_shard_rank}); refusing to bind a possibly cross-GPU zmq socket"
+        )
 
 
 def set_death_signal():
@@ -160,12 +194,17 @@ class vLLMColocateWorkerExtension:
         VLLMHijack.hijack()
         vllm_config = kwargs.get("vllm_config")
         weight_transfer_config = getattr(vllm_config, "weight_transfer_config", None)
-        if getattr(weight_transfer_config, "backend", None) == "verl_delta_ipc":
+        weight_transfer_backend = getattr(weight_transfer_config, "backend", None)
+        if weight_transfer_backend in ("verl_delta_ipc", "verl_delta_hccl"):
             from verl.workers.rollout.vllm_rollout.delta_weight_transfer import (
+                register_verl_delta_hccl_weight_transfer_engine,
                 register_verl_delta_weight_transfer_engine,
             )
 
-            register_verl_delta_weight_transfer_engine()
+            if weight_transfer_backend == "verl_delta_hccl":
+                register_verl_delta_hccl_weight_transfer_engine()
+            else:
+                register_verl_delta_weight_transfer_engine()
         # 2. patch online fp8 quant. Some models, including DeepSeek-V4, get
         # fp8 from the HF config rather than an explicit rollout quantization arg.
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1" or is_fp8_model(vllm_config):
@@ -419,15 +458,55 @@ class vLLMColocateWorkerExtension:
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         parallel_config = getattr(vllm_config, "parallel_config", None)
         local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)
+        pp_size = max(int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1), 1) if parallel_config else 1
+        if pp_size > 1:
+            _assert_weight_sync_rank_matches_groups(local_rank, parallel_config)
         trainer_rank_base = os.environ.get("VERL_ZMQ_BASE_TRAINER_RANK")
         trainer_rank = int(trainer_rank_base) + local_rank if trainer_rank_base is not None else local_rank
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
 
-    def update_verl_delta_weights(self, update_info: dict) -> None:
-        """Add this worker's IPC endpoint and forward the delta update to vLLM."""
-        worker_update_info = dict(update_info)
-        worker_update_info["zmq_handle"] = self._get_zmq_handle()
-        self.update_weights(worker_update_info)
+    def update_verl_delta_weights(self, update_info: dict | list[dict]) -> None:
+        """Forward the delta update to the transfer engine, adding this
+        worker's IPC endpoint when the payload travels over the colocated
+        zmq/IPC channel."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not isinstance(update_info, list):
+            update_info = {**update_info, "zmq_handle": self._get_zmq_handle()}
+        if not v023_compat.worker_update_weights(self, update_info):
+            # vllm 0.23.x compat handled the engine above; on #44353 hosts the
+            # host worker's update_weights indexes per-worker list entries
+            # (HCCL broadcast path) and drives the engine itself.
+            self.update_weights(update_info)
+
+    # ---- vllm 0.23.x compat lifecycle RPCs (NOT FOR UPSTREAM) -------------
+    # vLLM appends worker extension classes AFTER the worker class in the MRO
+    # and asserts the extension defines no attribute the worker already has,
+    # so these use VERL-specific names instead of overriding the host's
+    # lifecycle methods. On hosts where the engine is not a VERL 0.23.x
+    # compat engine they delegate to the host worker methods unchanged.
+    # See delta_weight_transfer_v023_compat.
+
+    def verl_delta_init_weight_transfer_engine(self, init_info: dict) -> None:
+        """init_weight_transfer_engine with the vllm 0.23.x compat dispatch."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not v023_compat.worker_init_weight_transfer_engine(self, init_info):
+            self.init_weight_transfer_engine(init_info)
+
+    def verl_delta_start_weight_update(self, *args, **kwargs) -> None:
+        """start_weight_update with the vllm 0.23.x compat dispatch."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not v023_compat.worker_start_weight_update(self):
+            self.start_weight_update(*args, **kwargs)
+
+    def verl_delta_finish_weight_update(self, *args, **kwargs) -> None:
+        """finish_weight_update with the vllm 0.23.x compat dispatch."""
+        from verl.workers.rollout.vllm_rollout import delta_weight_transfer_v023_compat as v023_compat
+
+        if not v023_compat.worker_finish_weight_update(self):
+            self.finish_weight_update(*args, **kwargs)
 
 
 class SuppressSignalInThread:

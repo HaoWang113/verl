@@ -84,6 +84,41 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _compute_external_dp_args(
+    *,
+    config,
+    gpus_per_node: int,
+    num_workers: int,
+    node_rank: int,
+    master_address,
+    dp_rpc_port,
+) -> dict:
+    """vLLM external-DP launch args for one node's slice of a DP replica.
+
+    A DP shard occupies ``tp * pp`` GPUs per node, so the local shard count is
+    ``gpus_per_node // (tp*pp)`` and this node's shards start at
+    ``node_rank * dp_size_local``. Mirrors vLLM's own device layout
+    (``dp_local * tp*pp + in_shard_rank``).
+    """
+    tp_pp_size = config.tensor_model_parallel_size * config.pipeline_model_parallel_size
+    assert gpus_per_node % tp_pp_size == 0, (
+        "gpus_per_node should be divisible by "
+        "tensor_model_parallel_size * pipeline_model_parallel_size"
+    )
+    data_parallel_size_local = gpus_per_node // tp_pp_size
+    assert num_workers == data_parallel_size_local * tp_pp_size, (
+        f"num workers ({num_workers}) should be equal to "
+        f"dp_size_local ({data_parallel_size_local}) * tp_pp_size ({tp_pp_size})"
+    )
+    return {
+        "data_parallel_size": config.data_parallel_size,
+        "data_parallel_size_local": data_parallel_size_local,
+        "data_parallel_start_rank": node_rank * data_parallel_size_local,
+        "data_parallel_address": master_address,
+        "data_parallel_rpc_port": dp_rpc_port,
+    }
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -338,6 +373,7 @@ class vLLMHttpServer:
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
+            "pipeline_parallel_size": self.config.pipeline_model_parallel_size,
             "seed": self.replica_rank + self.config.seed,
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,
@@ -380,22 +416,16 @@ class vLLMHttpServer:
             )
 
         if self.config.data_parallel_size > 1:
-            assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
-                "gpus_per_node should be divisible by tensor_model_parallel_size"
+            args.update(
+                _compute_external_dp_args(
+                    config=self.config,
+                    gpus_per_node=self.gpus_per_node,
+                    num_workers=len(self.workers),
+                    node_rank=self.node_rank,
+                    master_address=self._master_address,
+                    dp_rpc_port=self._dp_rpc_port,
+                )
             )
-            data_parallel_size_local = self.gpus_per_node // self.config.tensor_model_parallel_size
-            assert len(self.workers) == data_parallel_size_local * self.config.tensor_model_parallel_size, (
-                f"num workers ({len(self.workers)}) should be equal to "
-                f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
-            )
-            dp_args = {
-                "data_parallel_size": self.config.data_parallel_size,
-                "data_parallel_size_local": data_parallel_size_local,
-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
-                "data_parallel_address": self._master_address,
-                "data_parallel_rpc_port": self._dp_rpc_port,
-            }
-            args.update(dp_args)
 
         args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
 
@@ -1100,26 +1130,43 @@ class vLLMHttpServer:
         checkpoint_config = getattr(self.config, "checkpoint_engine", None)
         if getattr(checkpoint_config, "backend", None) == "delta_sharded":
             from verl.workers.rollout.vllm_rollout.delta_weight_transfer import (
+                VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND,
                 VERL_DELTA_WEIGHT_TRANSFER_BACKEND,
                 is_moe_model,
                 require_vllm_delta_support,
+                resolve_moe_delta_settings,
             )
 
             require_vllm_delta_support()
             delta_engine_kwargs = getattr(checkpoint_config, "engine_kwargs", {}).get("delta_sharded", {})
             if int(delta_engine_kwargs.get("verify_every", 0)) > 0:
                 raise NotImplementedError("delta_sharded with vLLM does not support verify_every > 0")
-            if self.config.data_parallel_size != 1:
-                raise NotImplementedError("delta_sharded with vLLM requires data_parallel_size=1")
             if self.config.disaggregation.enabled:
                 raise NotImplementedError("delta_sharded with vLLM does not support PD disaggregation")
-            # config.pipeline_model_parallel_size > 1 is already rejected globally;
-            # engine_kwargs is forwarded verbatim to vLLM, so close topology
-            # override paths that would bypass VERL's worker and IPC mapping.
-            if int(engine_kwargs.get("data_parallel_size") or 1) > 1:
-                raise NotImplementedError("delta_sharded with vLLM requires data_parallel_size=1")
-            if int(engine_kwargs.get("pipeline_parallel_size") or 1) > 1:
-                raise NotImplementedError("delta_sharded with vLLM requires pipeline_parallel_size=1")
+            tp_pp_size = self.config.tensor_model_parallel_size * self.config.pipeline_model_parallel_size
+            if tp_pp_size > self.gpus_per_node:
+                raise NotImplementedError(
+                    "delta_sharded with vLLM requires pipeline_parallel_size to fit within one node "
+                    f"(tensor_model_parallel_size * pipeline_model_parallel_size = {tp_pp_size} > "
+                    f"gpus_per_node = {self.gpus_per_node}); cross-node PP is not supported yet"
+                )
+            if self.config.pipeline_model_parallel_size > 1 and is_moe_model(self.model_config.hf_config):
+                raise NotImplementedError(
+                    "delta_sharded with vLLM does not support MoE models with pipeline_parallel_size > 1 "
+                    "yet (the expert layout-window path is PP=1 only)"
+                )
+            # engine_kwargs is forwarded verbatim to vLLM, so topology overrides
+            # must not bypass VERL's worker and IPC mapping.
+            for parallel_key, config_value in (
+                ("data_parallel_size", self.config.data_parallel_size),
+                ("pipeline_parallel_size", self.config.pipeline_model_parallel_size),
+            ):
+                engine_value = engine_kwargs.get(parallel_key)
+                if engine_value is not None and int(engine_value) != config_value:
+                    raise NotImplementedError(
+                        f"delta_sharded with vLLM requires engine_kwargs {parallel_key} to match "
+                        f"rollout.{parallel_key} (got {engine_value} != {config_value})"
+                    )
             engine_tp_size = engine_kwargs.get("tensor_parallel_size")
             if engine_tp_size is not None and int(engine_tp_size) != self.config.tensor_model_parallel_size:
                 raise NotImplementedError(
@@ -1128,14 +1175,13 @@ class vLLMHttpServer:
                 )
 
             if is_moe_model(self.model_config.hf_config):
-                moe_backend = engine_kwargs.get("moe_backend")
-                if moe_backend not in {None, "auto", "triton"}:
-                    raise NotImplementedError(
-                        f"delta_sharded with vLLM MoE requires moe_backend='triton'; got {moe_backend!r}"
-                    )
-                engine_kwargs["moe_backend"] = "triton"
-                if engine_kwargs.get("enable_eplb", False):
-                    raise NotImplementedError("delta_sharded with vLLM MoE does not support EPLB")
+                forced_moe_backend = resolve_moe_delta_settings(
+                    is_npu=is_torch_npu_available(check_device=False),
+                    moe_backend=engine_kwargs.get("moe_backend"),
+                    enable_eplb=bool(engine_kwargs.get("enable_eplb", False)),
+                )
+                if forced_moe_backend is not None:
+                    engine_kwargs["moe_backend"] = forced_moe_backend
 
             weight_transfer_config = engine_kwargs.get("weight_transfer_config")
             if weight_transfer_config is None:
@@ -1145,13 +1191,21 @@ class vLLMHttpServer:
             else:
                 raise TypeError("weight_transfer_config must be a mapping when using delta_sharded")
 
-            if weight_transfer_backend not in {None, VERL_DELTA_WEIGHT_TRANSFER_BACKEND}:
+            allowed_backends = {VERL_DELTA_WEIGHT_TRANSFER_BACKEND, VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND}
+            if weight_transfer_backend not in ({None} | allowed_backends):
                 raise ValueError(
-                    "checkpoint_engine.backend='delta_sharded' requires vLLM "
-                    f"weight transfer backend {VERL_DELTA_WEIGHT_TRANSFER_BACKEND!r}, "
+                    "checkpoint_engine.backend='delta_sharded' requires one of the VERL vLLM weight "
+                    f"transfer backends {sorted(allowed_backends)} (or none, for the platform default), "
                     f"but got {weight_transfer_backend!r}"
                 )
-            engine_kwargs["weight_transfer_config"] = {"backend": VERL_DELTA_WEIGHT_TRANSFER_BACKEND}
+            if weight_transfer_backend is None:
+                # Platform default: HCCL receivers on Ascend NPU, CUDA IPC elsewhere.
+                weight_transfer_backend = (
+                    VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND
+                    if is_torch_npu_available(check_device=False)
+                    else VERL_DELTA_WEIGHT_TRANSFER_BACKEND
+                )
+            engine_kwargs["weight_transfer_config"] = {"backend": weight_transfer_backend}
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""

@@ -317,7 +317,10 @@ class RolloutConfig(BaseConfig):
                 )
 
         if self.pipeline_model_parallel_size > 1:
-            if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
+            # vllm is PP-capable (its workers apply full-model streams; layers not
+            # held by a PP stage are skipped by the vLLM loader). sglang/trtllm
+            # keep their own independent rejections, as does the vllm PD path.
+            if self.name in ("sglang", "trtllm"):
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )

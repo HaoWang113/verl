@@ -20,8 +20,7 @@ checkpoint names, packed weights, and TP slicing.
 
 from __future__ import annotations
 
-import inspect
-import json
+import logging
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -29,7 +28,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 import vllm
 
-from verl.utils.device import get_device_name, is_cuda_available
+from verl.utils.device import get_device_name
+
+logger = logging.getLogger(__name__)
 
 try:
     from vllm.config.weight_transfer import WeightTransferConfig
@@ -48,9 +49,12 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.checkpoint_weight_patch import (
         CheckpointWeightPatch,
     )
+    from verl.workers.rollout.vllm_rollout.moe_online_update import ExpertLayoutWindow
 
 VERL_DELTA_WEIGHT_TRANSFER_BACKEND = "verl_delta_ipc"
+VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND = "verl_delta_hccl"
 _REGISTERED = False
+_HCCL_REGISTERED = False
 
 
 def _checkpoint_patch_api():
@@ -62,26 +66,67 @@ def _checkpoint_patch_api():
     except ImportError as exc:
         if exc.name != "vllm.model_executor.model_loader.checkpoint_weight_patch":
             raise
-        raise RuntimeError(
-            "checkpoint_engine.backend='delta_sharded' with vLLM requires the checkpoint patch API from "
-            f"vLLM #50723; installed vLLM {getattr(vllm, '__version__', 'unknown')} does not provide it. "
-            "Install a compatible vLLM build or select a different checkpoint engine backend."
-        ) from exc
+        # vllm 0.23.x compat (NOT FOR UPSTREAM): fall back to the vendored copy
+        # of vLLM #50723; see delta_weight_transfer_v023_compat.
+        from verl.workers.rollout.vllm_rollout._vendored.checkpoint_weight_patch import (
+            CheckpointWeightPatch,
+            load_checkpoint_weight_patches,
+        )
+        return CheckpointWeightPatch, load_checkpoint_weight_patches
     return CheckpointWeightPatch, load_checkpoint_weight_patches
 
 
 def require_vllm_delta_support() -> None:
-    """Verify that vLLM provides the required weight transfer and checkpoint patch APIs."""
+    """Verify that vLLM provides the required weight transfer and checkpoint patch APIs.
 
-    init_parameters = inspect.signature(WeightTransferEngine.__init__).parameters
-    if not {"config", "vllm_config", "device", "model"}.issubset(init_parameters):
+    Accepts either a #44353 host (engine-owned WeightTransferEngine API) or,
+    through the vllm 0.23.x compat shim, a vLLM 0.23.x host; anything else
+    fails loud. NOT FOR UPSTREAM: the 0.23.x leg is deployment/test-only
+    (see delta_weight_transfer_v023_compat).
+    """
+    from verl.workers.rollout.vllm_rollout.delta_weight_transfer_v023_compat import (
+        HOST_UNSUPPORTED,
+        classify_installed_host,
+    )
+
+    if classify_installed_host() == HOST_UNSUPPORTED:
         raise RuntimeError(
             "checkpoint_engine.backend='delta_sharded' with vLLM requires the engine-owned WeightTransferEngine "
-            "API from vLLM #44353 and the checkpoint patch API from vLLM #50723; installed vLLM "
-            f"{getattr(vllm, '__version__', 'unknown')} does not provide the required WeightTransferEngine API. "
+            "API from vLLM #44353 and the checkpoint patch API from vLLM #50723, or a vLLM 0.23.x host through "
+            "verl's compat shim (other pre-#44353 versions are not covered); installed vLLM "
+            f"{getattr(vllm, '__version__', 'unknown')} provides neither. "
             "Install a compatible vLLM build or select a different checkpoint engine backend."
         )
     _checkpoint_patch_api()
+
+
+def resolve_moe_delta_settings(*, is_npu: bool, moe_backend: Any, enable_eplb: bool) -> str | None:
+    """Validate MoE delta settings per platform; return the backend to force, if any.
+
+    CUDA keeps the historical triton-only contract (identical raise order and
+    messages). NPU no longer rejects MoE outright: the sparse layout window
+    (moe_online_update) replaces the kernel-backend requirement, so backend
+    pins are refused and the vllm-ascend default stays untouched. EPLB is
+    refused on both platforms -- dynamic_eplb splits expert weights into
+    per-expert lists with no in-place write target.
+    """
+    if is_npu:
+        if moe_backend not in {None, "auto"}:
+            raise NotImplementedError(
+                "delta_sharded with vLLM MoE on Ascend NPU relies on the checkpoint-layout window, not a kernel "
+                f"backend; leave moe_backend unset or 'auto' (got {moe_backend!r})"
+            )
+        if enable_eplb:
+            raise NotImplementedError(
+                "delta_sharded with vLLM MoE does not support EPLB (dynamic_eplb splits expert weights into "
+                "per-expert lists)"
+            )
+        return None
+    if moe_backend not in {None, "auto", "triton"}:
+        raise NotImplementedError(f"delta_sharded with vLLM MoE requires moe_backend='triton'; got {moe_backend!r}")
+    if enable_eplb:
+        raise NotImplementedError("delta_sharded with vLLM MoE does not support EPLB")
+    return "triton"
 
 
 def is_moe_model(hf_config) -> bool:
@@ -135,64 +180,27 @@ class VerlDeltaIPCUpdateInfo(WeightTransferUpdateInfo):
 def decode_delta_payload(
     named_tensors: Iterable[tuple[str, torch.Tensor]],
 ) -> tuple[str, list[CheckpointWeightPatch]]:
-    """Validate and decode one DeltaFlush into vLLM checkpoint patches."""
+    """Validate and decode one DeltaFlush into vLLM checkpoint patches.
 
-    from verl.checkpoint_engine.delta_sync.encode import checksum
+    The wire validation and per-parameter slicing live in the device-agnostic
+    :func:`verl.checkpoint_engine.delta_sync.decode_delta_wire` (shared with the
+    NPU HCCL receiver and the tests); this wrapper only converts the decoded
+    patches into vLLM's ``CheckpointWeightPatch``.
+    """
+    from verl.checkpoint_engine.delta_sync.decode import decode_delta_wire
 
     CheckpointWeightPatch, _ = _checkpoint_patch_api()
-    tensors = dict(named_tensors)
-    try:
-        spec_tensor = tensors["__delta_spec__"]
-        values = tensors["__values__"]
-        spec = json.loads(bytes(spec_tensor.detach().cpu().numpy().tobytes()).decode())
-    except KeyError as exc:
-        raise ValueError(f"DeltaFlush is missing {exc.args[0]}") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("DeltaFlush contains an invalid JSON spec") from exc
-
-    encoding = spec["encoding"]
-    if encoding not in {"dense", "indices"}:
-        raise ValueError(f"Unsupported DeltaFlush encoding: {encoding!r}")
-    positions = tensors.get("__positions__")
-    if positions is None:
-        positions = torch.empty(0, dtype=torch.uint8, device=values.device)
-    if encoding == "dense" and positions.numel():
-        raise ValueError("Dense DeltaFlush must not contain positions")
-    if encoding == "indices" and "__positions__" not in tensors:
-        raise ValueError("Indices DeltaFlush requires __positions__")
-
-    got_checksum = checksum(positions, values)
-    expected_checksum = int(spec["checksum"])
-    if got_checksum != expected_checksum:
-        raise RuntimeError(
-            f"Delta checksum mismatch in vLLM consumer: got {got_checksum}, expected {expected_checksum}"
+    encoding, patches = decode_delta_wire(named_tensors)
+    return encoding, [
+        CheckpointWeightPatch(
+            name=p.name,
+            shape=p.shape,
+            dtype=p.dtype,
+            values=p.values,
+            indices=p.positions,
         )
-
-    patches: list[CheckpointWeightPatch] = []
-    for param_spec in spec["params"]:
-        name = param_spec["name"]
-        dtype = getattr(torch, param_spec["dtype"])
-        patch_values = values[param_spec["val_start"] : param_spec["val_end"]]
-        if encoding == "dense":
-            patch_indices = None
-        else:
-            if param_spec["pos_width"] != 4:
-                raise ValueError(f"{name}: indices encoding requires pos_width=4")
-            pos_bytes = positions[param_spec["pos_start"] : param_spec["pos_end"]]
-            if pos_bytes.numel() != patch_values.numel() * 4:
-                raise ValueError(f"{name}: position and value slices have inconsistent lengths")
-            patch_indices = pos_bytes.view(torch.int32)
-
-        patches.append(
-            CheckpointWeightPatch(
-                name=name,
-                shape=tuple(param_spec["shape"]),
-                dtype=dtype,
-                values=patch_values,
-                indices=patch_indices,
-            )
-        )
-    return encoding, patches
+        for p in patches
+    ]
 
 
 class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
@@ -212,15 +220,12 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         super().__init__(config, vllm_config, device, model)
         self._session_encoding: str | None = None
         self._update_failed = False
+        self._sparse_session_begun = False
 
     def _validate_configuration(self) -> None:
         require_vllm_delta_support()
-        if not is_cuda_available or self.device.type != get_device_name():
-            raise NotImplementedError("VERL delta weight transfer requires CUDA")
-        if self.parallel_config.data_parallel_size != 1:
-            raise NotImplementedError("VERL delta weight transfer requires data_parallel_size=1")
-        if self.parallel_config.pipeline_parallel_size != 1:
-            raise NotImplementedError("VERL delta weight transfer requires pipeline_parallel_size=1")
+        if self.device.type != get_device_name():
+            raise NotImplementedError(f"VERL delta weight transfer requires {get_device_name()!r} devices")
         if self.model_config.dtype != torch.bfloat16:
             raise NotImplementedError("VERL delta weight transfer supports only BF16 vLLM models")
         if getattr(self.vllm_config, "quant_config", None) is not None:
@@ -238,7 +243,30 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 "fresh dense seed. Restarting only the vLLM workers is unsafe because the producer snapshot may "
                 "already have advanced."
             )
+        if self._sparse_session_begun:
+            raise RuntimeError(
+                "A previous sparse weight-update session never finished cleanly; restart the full job so every "
+                "rollout worker receives a fresh dense seed."
+            )
         self._session_encoding = None
+
+    def _on_sparse_session_begin(self) -> None:
+        """Prepare the model for in-place checkpoint-coordinate patches.
+
+        Invoked once, right before the first ``indices``-encoded flush of an
+        update session is applied. Default no-op: the reference engines run on
+        platforms whose live parameters already use checkpoint layout, so
+        sparse patches land correctly as-is. Platform engines override this to
+        open a layout window (see VerlDeltaHCCLWeightTransferEngine on Ascend
+        NPU, where MoE expert weights are stored transposed after load).
+        """
+
+    def _on_sparse_session_end(self) -> None:
+        """Close the layout window opened by :meth:`_on_sparse_session_begin`.
+
+        Invoked from ``finish_weight_update`` (and once, best effort, from the
+        failure path). Default no-op for the same reason as above.
+        """
 
     def _receive_payload(self, *, zmq_handle: str) -> list[tuple[str, torch.Tensor]]:
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
@@ -270,37 +298,79 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             raise callback_error
         return payload
 
+    def _decode_and_apply(self, payload: list[tuple[str, torch.Tensor]]) -> None:
+        """Decode one flush's named tensors into checkpoint patches and apply them."""
+        encoding, patches = decode_delta_payload(payload)
+
+        if self._session_encoding is None:
+            self._session_encoding = encoding
+            if encoding == "dense":
+                self._assert_dense_session_supported()
+                from vllm.model_executor.model_loader.reload import (
+                    initialize_layerwise_reload,
+                )
+
+                initialize_layerwise_reload(self.model)
+            else:
+                # Sparse patches are written in place at checkpoint
+                # coordinates: open the layout window before the first flush
+                # lands (no-op on reference engines).
+                self._sparse_session_begun = True
+                self._on_sparse_session_begin()
+        elif encoding != self._session_encoding:
+            raise ValueError(
+                "One weight update cannot mix dense and sparse DeltaFlush payloads "
+                f"({self._session_encoding!r} then {encoding!r})"
+            )
+
+        _, load_checkpoint_weight_patches = _checkpoint_patch_api()
+        # The trusted producer emits every changed position at most once;
+        # skip vLLM's sort-based duplicate check on the rollout GPU.
+        load_checkpoint_weight_patches(
+            self.model,
+            patches,
+            validate_unique_indices=False,
+        )
+
+    def _assert_dense_session_supported(self) -> None:
+        """Dense flushes lean on vLLM's layerwise reload, which copies reloaded
+        values back into the original parameter storage assuming runtime layout
+        equals checkpoint layout. Ascend fused-expert weights violate that after
+        the host's process_weights_after_loading transpose(1, 2): the reload's
+        ``_copy_and_restore_kernel_tensors`` fails in aclnnInplaceCopy (observed
+        on the seed flush, 2026-09-17). MoE rollouts must receive the sparse seed
+        (full-coverage indices flushes), which applies through the verl-owned
+        layout window instead."""
+        from verl.workers.rollout.vllm_rollout.moe_online_update import iter_expert_weight_modules
+
+        if next(iter_expert_weight_modules(self.model), None) is not None:
+            raise NotImplementedError(
+                "vLLM rollout model has fused-expert modules: dense DeltaFlush sessions are unsupported "
+                "because vLLM's layerwise reload cannot replay the vllm-ascend expert layout transform. "
+                "Ship the delta seed as indices encoding (the delta_sharded producer default)."
+            )
+
     def receive_weights(self, update_info: VerlDeltaIPCUpdateInfo) -> None:
         assert update_info.zmq_handle is not None
         try:
             payload = self._receive_payload(zmq_handle=update_info.zmq_handle)
-            encoding, patches = decode_delta_payload(payload)
-
-            if self._session_encoding is None:
-                self._session_encoding = encoding
-                if encoding == "dense":
-                    from vllm.model_executor.model_loader.reload import (
-                        initialize_layerwise_reload,
-                    )
-
-                    initialize_layerwise_reload(self.model)
-            elif encoding != self._session_encoding:
-                raise ValueError(
-                    "One weight update cannot mix dense and sparse DeltaFlush payloads "
-                    f"({self._session_encoding!r} then {encoding!r})"
-                )
-
-            _, load_checkpoint_weight_patches = _checkpoint_patch_api()
-            # The trusted producer emits every changed position at most once;
-            # skip vLLM's sort-based duplicate check on the rollout GPU.
-            load_checkpoint_weight_patches(
-                self.model,
-                patches,
-                validate_unique_indices=False,
-            )
+            self._decode_and_apply(payload)
         except BaseException:
             # An earlier flush may already have changed runtime weights, so a
             # later update would start from an unknown partial state.
+            if self._sparse_session_begun:
+                # Best effort: close the layout window so the poisoned-worker
+                # restart contract is the only remaining failure mode. Exactly
+                # one end attempt (flag cleared first) -- never re-enter a
+                # partially restored model.
+                self._sparse_session_begun = False
+                try:
+                    self._on_sparse_session_end()
+                except BaseException:
+                    logger.exception(
+                        "best-effort sparse session restore failed; restart the full job so every rollout worker "
+                        "receives a fresh dense seed"
+                    )
             self._update_failed = True
             raise
 
@@ -317,12 +387,23 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             except BaseException:
                 self._update_failed = True
                 raise
-        # Sparse updates write to initialized runtime tensors, so there is
-        # nothing to rebuild after the last flush.
+        elif self._session_encoding == "indices":
+            # Sparse updates replay platform load-time transforms to return
+            # live parameters to runtime layout (no-op on reference engines).
+            try:
+                self._on_sparse_session_end()
+            except BaseException:
+                self._update_failed = True
+                raise
+            finally:
+                # Exactly one end attempt: never re-enter a partially restored
+                # model; the poisoned-worker contract takes over.
+                self._sparse_session_begun = False
         self._session_encoding = None
 
     def shutdown(self) -> None:
         self._session_encoding = None
+        self._sparse_session_begun = False
 
     @staticmethod
     def trainer_send_weights(
@@ -330,6 +411,15 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         trainer_args: dict[str, Any] | Any,
     ) -> None:
         raise NotImplementedError("VERL sends DeltaFlush payloads; this adapter only receives them")
+
+
+def _compat_engine_cls(engine_cls: type) -> type:
+    """vllm 0.23.x compat hook (NOT FOR UPSTREAM): swap the feature engine
+    class for its 0.23.x subclass when the installed vLLM predates #44353;
+    identity on #44353 hosts. See delta_weight_transfer_v023_compat."""
+    from verl.workers.rollout.vllm_rollout.delta_weight_transfer_v023_compat import compat_engine_cls
+
+    return compat_engine_cls(engine_cls)
 
 
 def register_verl_delta_weight_transfer_engine() -> None:
@@ -342,6 +432,174 @@ def register_verl_delta_weight_transfer_engine() -> None:
 
     WeightTransferEngineFactory.register_engine(
         VERL_DELTA_WEIGHT_TRANSFER_BACKEND,
-        VerlDeltaIPCWeightTransferEngine,
+        _compat_engine_cls(VerlDeltaIPCWeightTransferEngine),
     )
     _REGISTERED = True
+
+
+@dataclass
+class VerlDeltaHCCLInitInfo(WeightTransferInitInfo):
+    """Rendezvous endpoints of the trainer's HCCL delta broadcast group."""
+
+    dist_ip: str
+    dist_port: int
+    zmq_ip: str
+    zmq_port: int
+    topic: str = "bucket_metadata"
+    world_size: int = 1
+
+
+@dataclass
+class VerlDeltaHCCLUpdateInfo(WeightTransferUpdateInfo):
+    """This worker's rank in the trainer's PyHccl delta broadcast group."""
+
+    group_rank: int
+
+
+class VerlDeltaHCCLWeightTransferEngine(VerlDeltaIPCWeightTransferEngine):
+    """Consume VERL DeltaFlush payloads directly from the trainer's HCCL broadcasts.
+
+    C1 receiver: instead of pulling each flush over the colocated zmq/IPC
+    channel, the vLLM worker process joins the trainer's PyHccl broadcast
+    group itself -- one manifest subscription plus two broadcasts per flush,
+    no payload forwarding hop and no IPC handle negotiation. The zmq SUB is
+    connected before the communicator is built (see
+    :mod:`verl.checkpoint_engine.delta_sync.hccl_receiver`); the trainer
+    additionally waits for every receiver's wire-ready flag before its first
+    publish, so no manifest can be lost. Both the SUB and the communicator are
+    created once and reused across weight-update sessions.
+    """
+
+    init_info_cls = VerlDeltaHCCLInitInfo
+    update_info_cls = VerlDeltaHCCLUpdateInfo
+
+    def __init__(self, config, vllm_config, device, model) -> None:
+        super().__init__(config, vllm_config, device, model)
+        self._rendezvous: VerlDeltaHCCLInitInfo | None = None
+        self._manifest_sub = None
+        self._comm = None
+        self._group_rank: int | None = None
+        self._expert_layout_window: "ExpertLayoutWindow | None" = None
+
+    def _validate_configuration(self) -> None:
+        require_vllm_delta_support()
+        if self.device.type != get_device_name():
+            raise NotImplementedError(f"VERL delta HCCL weight transfer requires {get_device_name()!r} devices")
+        if self.model_config.dtype != torch.bfloat16:
+            raise NotImplementedError("VERL delta HCCL weight transfer supports only BF16 vLLM models")
+        if getattr(self.vllm_config, "quant_config", None) is not None:
+            raise NotImplementedError("VERL delta HCCL weight transfer does not support quantized vLLM models")
+        if getattr(self.vllm_config, "speculative_config", None) is not None:
+            raise NotImplementedError("VERL delta HCCL weight transfer does not support speculative decoding")
+
+    def init_transfer_engine(self, init_info: VerlDeltaHCCLInitInfo) -> None:
+        self._validate_configuration()
+        self._rendezvous = init_info
+
+    def _ensure_channel(self, group_rank: int):
+        """Create (once) and return the (manifest SUB, PyHccl communicator) pair.
+
+        The SUB is connected BEFORE the communicator joins the group, and the
+        receiver raises its wire-ready flag only after joining (inside
+        :func:`build_delta_hccl_communicator`) -- so the trainer's pre-publish
+        poll of those flags implies every SUB is actively subscribed.
+        """
+        from verl.checkpoint_engine.delta_sync.hccl_receiver import (
+            build_delta_hccl_communicator,
+            connect_delta_manifest_sub,
+        )
+
+        if self._comm is None:
+            assert self._rendezvous is not None, "init_weight_transfer_engine must run first"
+            self._manifest_sub = connect_delta_manifest_sub(
+                self._rendezvous.zmq_ip, self._rendezvous.zmq_port, self._rendezvous.topic
+            )
+            self._comm = build_delta_hccl_communicator(
+                self._rendezvous.dist_ip,
+                self._rendezvous.dist_port,
+                group_rank,
+                self._rendezvous.world_size,
+                self.device,
+            )
+            self._group_rank = group_rank
+        else:
+            assert self._group_rank == group_rank, (
+                f"delta HCCL group rank changed between sessions: {self._group_rank} -> {group_rank}"
+            )
+        return self._manifest_sub, self._comm
+
+    def receive_weights(self, update_info: VerlDeltaHCCLUpdateInfo) -> None:
+        from verl.checkpoint_engine.delta_sync.hccl_receiver import pump_hccl_delta_session
+
+        assert self._rendezvous is not None, "init_weight_transfer_engine must run first"
+        try:
+            sub, comm = self._ensure_channel(update_info.group_rank)
+            pump_hccl_delta_session(
+                sub, comm, self.device, on_flush=self._decode_and_apply, group_rank=update_info.group_rank
+            )
+        except BaseException:
+            # A dropped receiver would otherwise hang the whole group forever:
+            # vLLM's collective_rpc propagates a worker error only after every
+            # worker returns, and the healthy peers block inside the next HCCL
+            # collective. Destroying this side's communicator tears the HCCL
+            # connections down, so the peers fail fast instead of hanging; the
+            # poisoned-worker contract already requires a full job restart.
+            self._update_failed = True
+            logger.exception(
+                "delta-hccl receiver group_rank=%s: weight-update session FAILED; aborting the communicator "
+                "so peers fail fast (full job restart required)",
+                update_info.group_rank,
+            )
+            self._abort_communicator()
+            raise
+
+    def _abort_communicator(self) -> None:
+        if self._comm is None:
+            return
+        try:
+            self._comm.destroyComm(self._comm.comm)
+        except BaseException:
+            logger.exception(
+                "delta-hccl receiver group_rank=%s: communicator abort failed (best effort)", self._group_rank
+            )
+        finally:
+            self._comm = None
+
+    def _on_sparse_session_begin(self) -> None:
+        from verl.workers.rollout.vllm_rollout.moe_online_update import open_expert_layout_window
+
+        self._expert_layout_window = open_expert_layout_window(self.model)
+
+    def _on_sparse_session_end(self) -> None:
+        if self._expert_layout_window is None:
+            return
+        from verl.workers.rollout.vllm_rollout.moe_online_update import close_expert_layout_window
+
+        close_expert_layout_window(self._expert_layout_window)
+        self._expert_layout_window = None
+
+    def shutdown(self) -> None:
+        super().shutdown()
+        if self._expert_layout_window is not None:
+            from verl.workers.rollout.vllm_rollout.moe_online_update import close_expert_layout_window
+
+            try:
+                close_expert_layout_window(self._expert_layout_window)
+            except BaseException:
+                logger.exception("best-effort expert layout restore during shutdown failed")
+            self._expert_layout_window = None
+
+
+def register_verl_delta_hccl_weight_transfer_engine() -> None:
+    """Register the HCCL adapter before vLLM creates its worker-side engine."""
+
+    global _HCCL_REGISTERED
+    if _HCCL_REGISTERED:
+        return
+    from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+
+    WeightTransferEngineFactory.register_engine(
+        VERL_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND,
+        _compat_engine_cls(VerlDeltaHCCLWeightTransferEngine),
+    )
+    _HCCL_REGISTERED = True

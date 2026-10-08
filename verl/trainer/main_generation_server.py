@@ -37,9 +37,14 @@ from verl.utils.hdfs_io import makedirs
 from verl.workers.rollout.replica import get_rollout_replica_class
 
 
+def _num_rollout_replicas(n_gpus_per_node: int, nnodes: int, tp_size: int, pp_size: int) -> int:
+    return (n_gpus_per_node * nnodes) // (tp_size * pp_size)
+
+
 async def start_server(config):
     tp_size = config.actor_rollout_ref.rollout.tensor_model_parallel_size
-    num_replicas = (config.trainer.n_gpus_per_node * config.trainer.nnodes) // tp_size
+    pp_size = config.actor_rollout_ref.rollout.pipeline_model_parallel_size
+    num_replicas = _num_rollout_replicas(config.trainer.n_gpus_per_node, config.trainer.nnodes, tp_size, pp_size)
     rollout_config = config.actor_rollout_ref.rollout
     model_config = config.actor_rollout_ref.model
     # create standalone rollout server

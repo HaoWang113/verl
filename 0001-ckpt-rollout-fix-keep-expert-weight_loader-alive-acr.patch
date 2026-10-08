@@ -1,0 +1,114 @@
+From d8e3a872e71cb77f5f2538eaa2973fd4b6a6ca82 Mon Sep 17 00:00:00 2001
+From: HaoWang113 <18701975378@163.com>
+Date: Fri, 18 Sep 2026 15:31:26 +0800
+Subject: [PATCH] [ckpt, rollout] fix: keep expert weight_loader alive across
+ the sparse layout window
+
+The sparse apply densifies indices patches into NaN-masked checkpoint
+tensors and re-enters model.load_weights, whose fused-expert loader reads
+param.weight_loader off the live parameters (E2E 2026-09-18: non-expert
+flushes applied fine, the first expert flush died with AttributeError).
+Stock vllm-ascend 0.23.0rc1 rebinds transposed experts as fresh
+Parameters in process_weights_after_loading and drops that attribute.
+
+- moe_online_update.py: window flips and restores rebind through
+  param.data, so the Parameter object -- and every load-time attribute --
+  survives each open/close cycle; no dependence on host replace_parameter
+  semantics. Window open now fails loud with a fix pointer when expert
+  parameters carry no weight_loader, instead of a cryptic AttributeError
+  mid-apply.
+- test_moe_online_update.py: FakeExperts fixture carries weight_loader.
+
+The load-time rebind itself is fixed platform-side: the untracked
+vllm-ascend 0.23.0rc1 patch gained a hunk rebinding the transposed
+experts via param.data (apply with patch -p1 --forward on the NPU
+machine; verified against both pristine and previously-patched trees).
+
+Co-authored-by: GLM5.3 <noreply@zhipuai.com>
+Signed-off-by: Hao Wang <wanghao232@huawei.com>
+Signed-off-by: Chuan Zheng <zhengchuan@huawei.com>
+---
+ .../test_moe_online_update.py                 |  3 ++
+ .../rollout/vllm_rollout/moe_online_update.py | 37 ++++++++++++++-----
+ 2 files changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/tests/checkpoint_engine/test_moe_online_update.py b/tests/checkpoint_engine/test_moe_online_update.py
+index e195ecc0..4c3d472f 100644
+--- a/tests/checkpoint_engine/test_moe_online_update.py
++++ b/tests/checkpoint_engine/test_moe_online_update.py
+@@ -36,6 +36,9 @@ class FakeExperts(torch.nn.Module):
+         super().__init__()
+         self.w13_weight = torch.nn.Parameter(torch.randn(E, K, 2 * N, dtype=dtype), requires_grad=False)
+         self.w2_weight = torch.nn.Parameter(torch.randn(E, N, K, dtype=dtype), requires_grad=False)
++        # loader attrs the window now requires to survive on live parameters
++        self.w13_weight.weight_loader = lambda *a, **k: None
++        self.w2_weight.weight_loader = lambda *a, **k: None
+ 
+ 
+ class FakeModel(torch.nn.Module):
+diff --git a/verl/workers/rollout/vllm_rollout/moe_online_update.py b/verl/workers/rollout/vllm_rollout/moe_online_update.py
+index caea7422..2fa34d84 100644
+--- a/verl/workers/rollout/vllm_rollout/moe_online_update.py
++++ b/verl/workers/rollout/vllm_rollout/moe_online_update.py
+@@ -18,7 +18,10 @@ On Ascend NPU, vllm-ascend transposes FusedMoE expert weights after load
+ conditional NZ / per-expert-list variants). Sparse delta patches carry
+ checkpoint coordinates and are applied in place, so a sparse update window
+ must expose the live expert weights at checkpoint layout and replay the
+-load-time transforms when the window closes.
++load-time transforms when the window closes. The flips rebind through
++``param.data`` so the Parameter object -- and the ``weight_loader``
++attribute the sparse apply's ``model.load_weights`` re-entry reads --
++survives every open/restore cycle.
+ 
+ Both certified vllm-ascend shapes (0.23.x and the anchored modular layout)
+ share the same ND main path and the pad step is a no-op on NPU (vllm core
+@@ -137,15 +140,16 @@ def _assert_nz_inactive() -> None:
+ 
+ 
+ def _replace_parameter(layer: torch.nn.Module, name: str, tensor: torch.Tensor) -> None:
+-    try:
+-        from vllm.model_executor.utils import replace_parameter
+-    except ImportError:
+-        replace_parameter = None
++    """Rebind one expert weight through ``param.data`` -- the Parameter object survives.
+ 
+-    if replace_parameter is not None:
+-        replace_parameter(layer, name, tensor)
+-    else:
+-        getattr(layer, name).data = tensor
++    Keeping the object preserves every attribute attached at load time, above
++    all ``weight_loader``: the sparse apply re-enters ``model.load_weights``,
++    whose fused-expert loader reads ``param.weight_loader`` off the live
++    parameters. vllm's ``replace_parameter`` carries that attribute over only
++    on hosts that fixed the attr carry-over (observed dropping on the 0.23.0
++    generation), so the window does not depend on it. The storage swap is
++    intended: the transpose must materialize a new storage either way."""
++    getattr(layer, name).data = tensor
+ 
+ 
+ def iter_expert_weight_modules(model: torch.nn.Module):
+@@ -178,6 +182,21 @@ def _assert_layer_supported(layer: torch.nn.Module) -> None:
+         raise NotImplementedError(
+             f"Expert weights must be BF16 for the sparse layout window, got w13={w13.dtype} w2={w2.dtype}."
+         )
++    # The apply path densifies sparse patches into NaN-masked checkpoint
++    # tensors and re-enters model.load_weights, whose fused-expert loader
++    # reads param.weight_loader on the live parameters. Stock vllm-ascend
++    # 0.23.0rc1 rebinds transposed experts as fresh Parameters in
++    # process_weights_after_loading and drops that attribute, so the first
++    # expert flush dies with AttributeError mid-apply. Fail loud at window
++    # open instead, with the fix pointer.
++    if not hasattr(w13, "weight_loader") or not hasattr(w2, "weight_loader"):
++        raise NotImplementedError(
++            f"Expert weights on {type(layer).__name__} carry no weight_loader attribute: the host "
++            "vllm-ascend rebinds transposed experts as fresh Parameters in process_weights_after_loading. "
++            "The sparse apply re-enters model.load_weights, which reads param.weight_loader; apply the verl "
++            "delta vllm-ascend patch (tests/special_npu/vllm_ascend_moe_online_update_0230rc1.patch) or "
++            "move to a host that preserves loader attributes across post-load transforms."
++        )
+ 
+ 
+ def prepare_expert_weights_for_online_update(layer: torch.nn.Module, window: ExpertLayoutWindow) -> None:
+-- 
+2.53.0
+

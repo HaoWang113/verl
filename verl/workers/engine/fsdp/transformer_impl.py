@@ -939,6 +939,8 @@ class FSDPEngine(BaseEngine):
                 if p.is_floating_point():
                     p = p.to(torch.bfloat16, non_blocking=True)
                 local = p.to_local() if hasattr(p, "to_local") else p
+                if hasattr(torch, "npu") and torch.npu.is_available():
+                    torch.npu.current_stream().synchronize()
                 yield name, local.reshape(-1), spec
 
         return _gen(), None

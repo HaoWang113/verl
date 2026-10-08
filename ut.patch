@@ -1,0 +1,13 @@
+diff --git a/tests/checkpoint_engine/test_moe_online_update.py b/tests/checkpoint_engine/test_moe_online_update.py
+index 7501c72a..a0e7bd7e 100644
+--- a/tests/checkpoint_engine/test_moe_online_update.py
++++ b/tests/checkpoint_engine/test_moe_online_update.py
+@@ -50,6 +50,8 @@ def _make_engine():
+
+     engine = object.__new__(VerlDeltaIPCWeightTransferEngine)
+     engine.model = torch.nn.Module()
++    # stub for the attribute base WeightTransferEngine.__init__ injects (dense finalize reads it)
++    engine.model_config = SimpleNamespace(dtype=torch.bfloat16)
+     engine._session_encoding = None
+     engine._update_failed = False
+     engine._sparse_session_begun = False

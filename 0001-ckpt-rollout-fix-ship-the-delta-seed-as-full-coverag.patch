@@ -1,0 +1,424 @@
+From ec62761486b74b974314c2c6cd5e46a025eb6bde Mon Sep 17 00:00:00 2001
+From: HaoWang113 <18701975378@163.com>
+Date: Thu, 17 Sep 2026 17:38:19 +0800
+Subject: [PATCH] [ckpt, rollout] fix: ship the delta seed as full-coverage
+ indices flushes
+
+The seed (first sync) streamed the full export over the values-only wire
+(wire tag "dense"), which lands on the receiver's vLLM layerwise-reload
+path. That machinery copies reloaded values back into the original
+parameter storage assuming runtime layout == checkpoint layout; Ascend
+fused-expert weights violate that after vllm-ascend's
+process_weights_after_loading transpose(1, 2), so the very first sync
+crashed in aclnnInplaceCopy on NPU MoE rollouts ([128, 2N, K] copied
+into [128, K, 2N]) before any sparse session could open.
+
+- delta_sync/pipeline.py: _send_full_seed now dispatches; the seed ships
+  as full-coverage indices flushes through the existing steady assembly
+  (_bucket_full_coverage + _assemble_flush + _publish_flush), so every
+  seed write goes through the receiver's verl-owned layout window. The
+  SGLang verify sweep keeps the values-only wire (_send_values_sweep).
+  Wire cost ~3x the values seed (int32 positions + values), paid once
+  per engine start.
+- delta_weight_transfer.py: fail loud when a dense flush arrives and the
+  rollout model has fused-expert modules -- the dense path is
+  structurally broken there; point operators at the indices seed.
+
+The NCCL/CUDA delta engine shares this mixin and switches identically
+(uniform protocol; its MoE dense seed worked only by layout coincidence).
+
+Co-authored-by: GLM5.3 <noreply@zhipuai.com>
+Signed-off-by: Hao Wang <wanghao232@huawei.com>
+Signed-off-by: Chuan Zheng <zhengchuan@huawei.com>
+---
+ .../test_moe_online_update.py                 |  12 ++
+ tests/checkpoint_engine/test_sharded_delta.py |  92 ++++++++++++
+ verl/checkpoint_engine/delta_sync/pipeline.py | 140 +++++++++++++++---
+ .../vllm_rollout/delta_weight_transfer.py     |  19 +++
+ 4 files changed, 243 insertions(+), 20 deletions(-)
+
+diff --git a/tests/checkpoint_engine/test_moe_online_update.py b/tests/checkpoint_engine/test_moe_online_update.py
+index 7501c72a..e195ecc0 100644
+--- a/tests/checkpoint_engine/test_moe_online_update.py
++++ b/tests/checkpoint_engine/test_moe_online_update.py
+@@ -50,6 +50,8 @@ def _make_engine():
+ 
+     engine = object.__new__(VerlDeltaIPCWeightTransferEngine)
+     engine.model = torch.nn.Module()
++    # stub for the attribute base WeightTransferEngine.__init__ injects (dense finalize reads it)
++    engine.model_config = SimpleNamespace(dtype=torch.bfloat16)
+     engine._session_encoding = None
+     engine._update_failed = False
+     engine._sparse_session_begun = False
+@@ -215,6 +217,16 @@ def test_dense_session_skips_sparse_hooks(patched_patch_api, monkeypatch):
+     assert sparse_calls == [] and engine._sparse_session_begun is False
+ 
+ 
++def test_dense_flush_rejected_on_moe_model(monkeypatch):
++    """The dense wire (the old seed protocol) must fail loud on MoE rollouts:
++    vLLM's layerwise reload cannot replay the Ascend expert layout transform."""
++    engine = _make_engine()
++    engine.model = FakeModel(FakeExperts())
++    with pytest.raises(NotImplementedError, match="indices encoding"):
++        _flush(engine, "dense", monkeypatch)
++    assert engine._session_encoding == "dense" and engine._sparse_session_begun is False
++
++
+ def test_mixed_encoding_rejected(patched_patch_api, monkeypatch):
+     engine = _make_engine()
+     _flush(engine, "indices", monkeypatch)
+diff --git a/tests/checkpoint_engine/test_sharded_delta.py b/tests/checkpoint_engine/test_sharded_delta.py
+index 15f74598..641581b3 100644
+--- a/tests/checkpoint_engine/test_sharded_delta.py
++++ b/tests/checkpoint_engine/test_sharded_delta.py
+@@ -301,3 +301,95 @@ def test_hf_delta_export_requires_seed():
+ 
+     with pytest.raises(AssertionError, match="seed snapshot"):
+         list(hf_delta_export(raw(), {}, _hf_entry_identity))
++
++
++def _make_seed_engine(bucket_size: int = 1 << 30):
++    """DeltaSyncMixin without a transport parent: published flushes land in a list."""
++    from verl.checkpoint_engine.delta_sync.pipeline import DeltaSyncMixin
++
++    class _SeedEngineStub(DeltaSyncMixin):
++        def __init__(self):
++            super().__init__(encoding="indices", batch_gather=32, verify_every=0)
++            self.bucket_size = bucket_size
++            self.rollout_dtype = torch.bfloat16
++            self.rank = 0
++            self.is_master = True
++            self.released: str | None = None
++            self.published: list[tuple[object, bool, bool]] = []
++            self.terminals: list[bool] = []
++
++        @property
++        def _wire_device(self):
++            return "cpu"
++
++        def _publish_flush(self, flush, first: bool, is_last: bool) -> None:
++            self.published.append((flush, first, is_last))
++
++        def _publish_terminal(self, first: bool) -> None:
++            self.terminals.append(first)
++
++        def _release_after_round(self, phase: str) -> None:
++            self.released = phase
++
++    return _SeedEngineStub()
++
++
++def test_full_seed_ships_full_coverage_indices():
++    """The seed (first sync) must ride the indices wire with every position
++    covered and is_full pinned -- the sparse window path owns the NPU MoE
++    layout contract; a dense-tagged seed crashes the receiver there."""
++    engine = _make_seed_engine()
++    a = torch.arange(0, 8, dtype=torch.float32).reshape(2, 4).to(torch.bfloat16)
++    b = torch.full((3,), 0.5, dtype=torch.bfloat16)
++    metrics = engine._send_full_seed(iter([("a", a), ("b", b)]), global_steps=1)
++
++    assert len(engine.published) == 1
++    flush, first, is_last = engine.published[0]
++    assert first is True and is_last is True and flush.encoding == "indices"
++    assert [p.name for p in flush.params] == ["a", "b"]
++    assert torch.equal(flush.positions_cpu.view(torch.int32), torch.arange(11, dtype=torch.int32))
++    assert torch.equal(flush.values_gpu, torch.cat([a.reshape(-1), b]))
++    assert engine.released == "seed" and engine.terminals == []
++    assert metrics is not None and metrics["checkpoint_engine/changed_ratio"] == 1.0
++
++
++def test_full_seed_slices_and_stays_in_order(monkeypatch):
++    """Pieces larger than MAX_ENTRY_ELEMS split transparently; concatenating the
++    published flushes must reproduce the full positions arange and exact values."""
++    from verl.checkpoint_engine.delta_sync.pipeline import DeltaSyncMixin
++
++    monkeypatch.setattr(DeltaSyncMixin, "MAX_ENTRY_ELEMS", 16)
++    engine = _make_seed_engine(bucket_size=8)
++    big = torch.randn(64, dtype=torch.bfloat16)
++    engine._send_full_seed(iter([("big", big)]), global_steps=2)
++
++    assert len(engine.published) == 4
++    assert all(first is True for _, first, _ in engine.published)
++    assert [is_last for _, _, is_last in engine.published] == [False, False, False, True]
++    pos = torch.cat([f.positions_cpu.view(torch.int32) for f, _, _ in engine.published])
++    val = torch.cat([f.values_gpu for f, _, _ in engine.published])
++    assert torch.equal(pos, torch.arange(64, dtype=torch.int32))
++    assert torch.equal(val, big)
++
++
++def test_full_verify_keeps_values_wire(monkeypatch):
++    """The SGLang verify sweep keeps the values-only ("dense") wire -- only the
++    seed moved to indices."""
++    engine = _make_seed_engine()
++    swept = []
++    monkeypatch.setattr(
++        engine, "_publish_values_flush", lambda params, values, is_last, verify: swept.append((is_last, verify))
++    )
++    t = torch.randn(4, dtype=torch.bfloat16)
++    engine._send_full_seed(iter([("t", t)]), global_steps=3, verify=True)
++
++    assert swept == [(True, True)]
++    assert engine.published == [] and engine.terminals == []
++
++
++def test_full_seed_empty_streams_terminal():
++    """Zero-tensor export ends the round with the terminal marker, no flush."""
++    engine = _make_seed_engine()
++    metrics = engine._send_full_seed(iter([]), global_steps=0)
++    assert engine.published == [] and engine.terminals == [True]
++    assert metrics is None
+diff --git a/verl/checkpoint_engine/delta_sync/pipeline.py b/verl/checkpoint_engine/delta_sync/pipeline.py
+index 6a11266a..d42ed9ce 100644
+--- a/verl/checkpoint_engine/delta_sync/pipeline.py
++++ b/verl/checkpoint_engine/delta_sync/pipeline.py
+@@ -69,7 +69,7 @@ class _FlushPiece:
+ 
+ @dataclass(slots=True)
+ class _ValuesPiece:
+-    """One whole parameter's flat values buffered for the seed sync's values-only flush."""
++    """One whole parameter's flat values buffered for the verify sweep's values-only flush."""
+ 
+     name: str
+     dtype_str: str
+@@ -129,6 +129,19 @@ def _bucket_sliced(bkt: _FlushBucket, name: str, dtype_str: str, shape, aidx: to
+         )
+ 
+ 
++def _bucket_full_coverage(bkt: _FlushBucket, name: str, dtype_str: str, shape, flat: torch.Tensor) -> None:
++    """Slice one whole parameter into <= MAX_ENTRY_ELEMS full-coverage entries
++    (per-slice int32 arange positions + values) for the indices seed. Positions are
++    generated per slice so even a half-billion-element tensor never materializes
++    one giant arange; bucket bytes = actual wire bytes (int32 positions + values)."""
++    max_elems = DeltaSyncMixin.MAX_ENTRY_ELEMS
++    n = int(flat.numel())
++    for s in range(0, n, max_elems):
++        e = min(s + max_elems, n)
++        idx = torch.arange(s, e, dtype=torch.int32, device=flat.device)
++        bkt.add(_FlushPiece(name, dtype_str, shape, idx, flat[s:e]), (e - s) * (4 + flat.element_size()))
++
++
+ class _GatherQueue:
+     """Per-gather-group batching of slot-keyed queue entries
+     ``(slots, dtype_str, counts, idx, val)``. Entries carry FINAL-coordinate
+@@ -201,9 +214,10 @@ class DeltaSyncMixin:
+ 
+     ``send_weights`` takes the TRAINING ENGINE and drives the sync itself: the
+     seed (first sync) streams the backend's full ``get_per_tensor_param()``
+-    export over the values-only wire and pins the diff base
+-    (``prime_delta_snapshots``); every steady sync consumes the backend's HF
+-    delta export ``get_per_tensor_param_delta_shard()`` -- per-parameter
++    export as full-coverage indices flushes (the receiver's sparse layout window
++    owns the NPU MoE layout contract; the values-only wire cannot) and pins the
++    diff base (``prime_delta_snapshots``); every steady sync consumes the
++    backend's HF delta export ``get_per_tensor_param_delta_shard()`` -- per-parameter
+     FINAL-HF-coordinate entries ``(slots, dtype_str, counts, hf_idx, hf_val,
+     gather_group)``. Naming, to-HF conversion, diff and snapshot all live on
+     the backend side (see :mod:`verl.workers.engine.utils`); this mixin only
+@@ -285,9 +299,11 @@ class DeltaSyncMixin:
+     def _publish_values_flush(
+         self, params: list[DeltaParam], values: torch.Tensor, is_last: bool, verify: bool = False
+     ) -> None:
+-        """Publish a values-only (full-coverage, positions-free) flush -- used by the first
+-        sync. The wire encoding tag stays ``"dense"`` -- it is protocol, shared with the
+-        receiver's delta_loader decode."""
++        """Publish a values-only (full-coverage, positions-free) flush -- used by the
++        SGLang verify sweep (``verify_every``). The wire encoding tag stays ``"dense"``
++        -- it is protocol, shared with the receiver's delta_loader decode. The seed
++        does NOT ride this wire: on NPU MoE rollouts vLLM's layerwise reload cannot
++        replay the host's expert layout transform, so dense flushes crash there."""
+         values = values.contiguous()
+         empty_pos = torch.empty(0, dtype=torch.uint8, device=values.device)
+         meta = {
+@@ -384,7 +400,26 @@ class DeltaSyncMixin:
+         global_steps: int | None = None,
+         verify: bool = False,
+     ) -> dict[str, float] | None:
+-        """First sync: stream the backend's FULL HF export over the values-only wire.
++        """Full export sweep: indices seed by default, values-only wire for verify."""
++        if verify:
++            return self._send_values_sweep(weights, global_steps)
++        return self._send_indices_seed(weights, global_steps)
++
++    def _send_indices_seed(
++        self,
++        weights: Generator[tuple[str, torch.Tensor], None, None],
++        global_steps: int | None = None,
++    ) -> dict[str, float] | None:
++        """First sync: ship the full export as FULL-COVERAGE indices flushes.
++
++        The seed must not ride the values-only ("dense") wire on NPU MoE rollouts:
++        vLLM's layerwise reload cannot replay vllm-ascend's expert layout transform
++        (process_weights_after_loading's transpose(1, 2)), so a dense flush there
++        dies copying checkpoint coordinates into runtime-layout storage. Full-
++        coverage indices patches keep every write on the sparse window path, which
++        owns the layout contract (open window -> checkpoint coords -> patch ->
++        restore). Wire cost is ~3x the values seed (int32 position + value per
++        element), paid once per engine start.
+ 
+         ``weights`` is ``get_per_tensor_param()`` -- every backend already knows how
+         to assemble and convert its own full tensors (FSDP all-gather, veomni expert
+@@ -398,6 +433,77 @@ class DeltaSyncMixin:
+         total_elems = 0
+         wire_bytes = 0
+ 
++        def _publish_seed(flush, is_last: bool) -> None:
++            nonlocal n_flushes, wire_bytes
++            self._publish_flush(flush, first=True, is_last=is_last)
++            n_flushes += 1
++            wire_bytes += int(flush.positions_cpu.numel()) + int(flush.values_gpu.nbytes)
++
++        bkt = _FlushBucket(self.bucket_size, self._assemble_flush, _publish_seed)
++
++        seen_names: set = set()
++        for name, tensor in weights:
++            # duplicate names in a full export mean two source params mapped to
++            # the same HF tensor -- the receiver would apply whichever came last
++            # and the delta diff base would silently disagree with the trainer
++            # (observed: NemotronH A_log). Fail loud instead.
++            assert name not in seen_names, f"full export yields duplicate HF tensor {name!r}"
++            seen_names.add(name)
++            tensor = tensor.detach()
++            if tensor.is_floating_point() and tensor.dtype != self.rollout_dtype:
++                tensor = tensor.to(self.rollout_dtype)
++            if not is_r0:
++                del tensor
++                continue
++            flat = tensor.contiguous().reshape(-1)
++            total_elems += int(flat.numel())
++            _bucket_full_coverage(bkt, name, str(flat.dtype).replace("torch.", ""), list(tensor.shape), flat)
++
++        if not is_r0:
++            return
++        bkt.seal()
++        if bkt.pending is not None:
++            bkt.emit(is_last=True)
++        else:
++            self._publish_terminal(True)
++        self._release_after_round("seed")
++        elapsed = time.time() - t0
++        # warning level on purpose: worker default log level swallows info, and the
++        # one-off seed cost is the number people ask for when sizing a run.
++        logger.warning(
++            "delta-sharded FULL-SEED(indices) v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
++            global_steps,
++            elapsed,
++            n_flushes,
++            total_elems,
++            wire_bytes / (1 << 30),
++        )
++        if not total_elems:
++            return None
++        return {
++            "checkpoint_engine/changed_ratio": 1.0,
++            "checkpoint_engine/changed_elems": float(total_elems),
++            "checkpoint_engine/payload_mbytes": wire_bytes / (1 << 20),
++            "checkpoint_engine/flushes": float(n_flushes),
++            "checkpoint_engine/elapsed_seconds": elapsed,
++        }
++
++    def _send_values_sweep(
++        self,
++        weights: Generator[tuple[str, torch.Tensor], None, None],
++        global_steps: int | None = None,
++    ) -> dict[str, float] | None:
++        """SGLang verify sweep: stream the full export over the values-only wire.
++
++        The receiver bit-compares each destination before overwriting (delta_loader
++        ``_verify_dense``), which the indices wire does not provide. vLLM rejects
++        ``verify_every > 0`` at startup, so this wire never carries an NPU MoE flush."""
++        is_r0 = self.is_master
++        t0 = time.time()
++        n_flushes = 0
++        total_elems = 0
++        wire_bytes = 0
++
+         def _assemble_values(pieces: list[_ValuesPiece]):
+             params = []
+             val_off = 0
+@@ -421,7 +527,7 @@ class DeltaSyncMixin:
+         def _publish_values(pending, is_last: bool) -> None:
+             nonlocal n_flushes, wire_bytes
+             params, values = pending
+-            self._publish_values_flush(params, values, is_last=is_last, verify=verify)
++            self._publish_values_flush(params, values, is_last=is_last, verify=True)
+             n_flushes += 1
+             wire_bytes += int(values.nbytes)
+ 
+@@ -429,10 +535,6 @@ class DeltaSyncMixin:
+ 
+         seen_names: set = set()
+         for name, tensor in weights:
+-            # duplicate names in a full export mean two source params mapped to
+-            # the same HF tensor -- the receiver would apply whichever came last
+-            # and the delta diff base would silently disagree with the trainer
+-            # (observed: NemotronH A_log). Fail loud instead.
+             assert name not in seen_names, f"full export yields duplicate HF tensor {name!r}"
+             seen_names.add(name)
+             tensor = tensor.detach()
+@@ -454,11 +556,8 @@ class DeltaSyncMixin:
+             self._publish_terminal(True)
+         self._release_after_round("seed")
+         elapsed = time.time() - t0
+-        # warning level on purpose: worker default log level swallows info, and the
+-        # one-off seed cost is the number people ask for when sizing a run.
+         logger.warning(
+-            "delta-sharded FULL-%s v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
+-            "VERIFY" if verify else "SEED",
++            "delta-sharded FULL-VERIFY v=%s done in %.1fs (flushes=%d elems=%d wire=%.1fGB)",
+             global_steps,
+             elapsed,
+             n_flushes,
+@@ -484,9 +583,10 @@ class DeltaSyncMixin:
+         engines, which consume a weights iterator): the seed/steady phase choice
+         and the snapshot prime are this engine's own state machine, so the worker
+         stays delta-agnostic. The seed (first sync) streams the backend's full
+-        ``get_per_tensor_param()`` export over the values-only wire, then pins the
+-        diff base via ``engine.prime_delta_snapshots()``; every later sync consumes
+-        ``get_per_tensor_param_delta_shard()`` (backend-computed final-HF deltas).
++        ``get_per_tensor_param()`` export as full-coverage indices flushes, then
++        pins the diff base via ``engine.prime_delta_snapshots()``; every later sync
++        consumes ``get_per_tensor_param_delta_shard()`` (backend-computed final-HF
++        deltas).
+         """
+         # All actor ranks participate (gather-v is collective); only torch rank 0 broadcasts.
+         # rank 0 accumulates the gathered per-param deltas into bucket_size-sized flushes and streams
+diff --git a/verl/workers/rollout/vllm_rollout/delta_weight_transfer.py b/verl/workers/rollout/vllm_rollout/delta_weight_transfer.py
+index 01ca2f5f..f56ac338 100644
+--- a/verl/workers/rollout/vllm_rollout/delta_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/delta_weight_transfer.py
+@@ -309,6 +309,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
+         if self._session_encoding is None:
+             self._session_encoding = encoding
+             if encoding == "dense":
++                self._assert_dense_session_supported()
+                 from vllm.model_executor.model_loader.reload import (
+                     initialize_layerwise_reload,
+                 )
+@@ -335,6 +336,24 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
+             validate_unique_indices=False,
+         )
+ 
++    def _assert_dense_session_supported(self) -> None:
++        """Dense flushes lean on vLLM's layerwise reload, which copies reloaded
++        values back into the original parameter storage assuming runtime layout
++        equals checkpoint layout. Ascend fused-expert weights violate that after
++        the host's process_weights_after_loading transpose(1, 2): the reload's
++        ``_copy_and_restore_kernel_tensors`` fails in aclnnInplaceCopy (observed
++        on the seed flush, 2026-09-17). MoE rollouts must receive the sparse seed
++        (full-coverage indices flushes), which applies through the verl-owned
++        layout window instead."""
++        from verl.workers.rollout.vllm_rollout.moe_online_update import iter_expert_weight_modules
++
++        if next(iter_expert_weight_modules(self.model), None) is not None:
++            raise NotImplementedError(
++                "vLLM rollout model has fused-expert modules: dense DeltaFlush sessions are unsupported "
++                "because vLLM's layerwise reload cannot replay the vllm-ascend expert layout transform. "
++                "Ship the delta seed as indices encoding (the delta_sharded producer default)."
++            )
++
+     def receive_weights(self, update_info: VerlDeltaIPCUpdateInfo) -> None:
+         assert update_info.zmq_handle is not None
+         try:
+-- 
+2.53.0
+

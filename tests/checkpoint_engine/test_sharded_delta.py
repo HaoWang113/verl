@@ -301,3 +301,95 @@ def test_hf_delta_export_requires_seed():
 
     with pytest.raises(AssertionError, match="seed snapshot"):
         list(hf_delta_export(raw(), {}, _hf_entry_identity))
+
+
+def _make_seed_engine(bucket_size: int = 1 << 30):
+    """DeltaSyncMixin without a transport parent: published flushes land in a list."""
+    from verl.checkpoint_engine.delta_sync.pipeline import DeltaSyncMixin
+
+    class _SeedEngineStub(DeltaSyncMixin):
+        def __init__(self):
+            super().__init__(encoding="indices", batch_gather=32, verify_every=0)
+            self.bucket_size = bucket_size
+            self.rollout_dtype = torch.bfloat16
+            self.rank = 0
+            self.is_master = True
+            self.released: str | None = None
+            self.published: list[tuple[object, bool, bool]] = []
+            self.terminals: list[bool] = []
+
+        @property
+        def _wire_device(self):
+            return "cpu"
+
+        def _publish_flush(self, flush, first: bool, is_last: bool) -> None:
+            self.published.append((flush, first, is_last))
+
+        def _publish_terminal(self, first: bool) -> None:
+            self.terminals.append(first)
+
+        def _release_after_round(self, phase: str) -> None:
+            self.released = phase
+
+    return _SeedEngineStub()
+
+
+def test_full_seed_ships_full_coverage_indices():
+    """The seed (first sync) must ride the indices wire with every position
+    covered and is_full pinned -- the sparse window path owns the NPU MoE
+    layout contract; a dense-tagged seed crashes the receiver there."""
+    engine = _make_seed_engine()
+    a = torch.arange(0, 8, dtype=torch.float32).reshape(2, 4).to(torch.bfloat16)
+    b = torch.full((3,), 0.5, dtype=torch.bfloat16)
+    metrics = engine._send_full_seed(iter([("a", a), ("b", b)]), global_steps=1)
+
+    assert len(engine.published) == 1
+    flush, first, is_last = engine.published[0]
+    assert first is True and is_last is True and flush.encoding == "indices"
+    assert [p.name for p in flush.params] == ["a", "b"]
+    assert torch.equal(flush.positions_cpu.view(torch.int32), torch.arange(11, dtype=torch.int32))
+    assert torch.equal(flush.values_gpu, torch.cat([a.reshape(-1), b]))
+    assert engine.released == "seed" and engine.terminals == []
+    assert metrics is not None and metrics["checkpoint_engine/changed_ratio"] == 1.0
+
+
+def test_full_seed_slices_and_stays_in_order(monkeypatch):
+    """Pieces larger than MAX_ENTRY_ELEMS split transparently; concatenating the
+    published flushes must reproduce the full positions arange and exact values."""
+    from verl.checkpoint_engine.delta_sync.pipeline import DeltaSyncMixin
+
+    monkeypatch.setattr(DeltaSyncMixin, "MAX_ENTRY_ELEMS", 16)
+    engine = _make_seed_engine(bucket_size=8)
+    big = torch.randn(64, dtype=torch.bfloat16)
+    engine._send_full_seed(iter([("big", big)]), global_steps=2)
+
+    assert len(engine.published) == 4
+    assert all(first is True for _, first, _ in engine.published)
+    assert [is_last for _, _, is_last in engine.published] == [False, False, False, True]
+    pos = torch.cat([f.positions_cpu.view(torch.int32) for f, _, _ in engine.published])
+    val = torch.cat([f.values_gpu for f, _, _ in engine.published])
+    assert torch.equal(pos, torch.arange(64, dtype=torch.int32))
+    assert torch.equal(val, big)
+
+
+def test_full_verify_keeps_values_wire(monkeypatch):
+    """The SGLang verify sweep keeps the values-only ("dense") wire -- only the
+    seed moved to indices."""
+    engine = _make_seed_engine()
+    swept = []
+    monkeypatch.setattr(
+        engine, "_publish_values_flush", lambda params, values, is_last, verify: swept.append((is_last, verify))
+    )
+    t = torch.randn(4, dtype=torch.bfloat16)
+    engine._send_full_seed(iter([("t", t)]), global_steps=3, verify=True)
+
+    assert swept == [(True, True)]
+    assert engine.published == [] and engine.terminals == []
+
+
+def test_full_seed_empty_streams_terminal():
+    """Zero-tensor export ends the round with the terminal marker, no flush."""
+    engine = _make_seed_engine()
+    metrics = engine._send_full_seed(iter([]), global_steps=0)
+    assert engine.published == [] and engine.terminals == [True]
+    assert metrics is None
