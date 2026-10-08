@@ -325,6 +325,44 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 logger.info("[FIX-DIAG] _apply_dense_buckets BEFORE load_weights: %s", moe_before)
         except Exception:
             pass
+        # [DIAG-DENSE 2026-10-08] Dense seed path (v=0) -- dump name+shape of the
+        # first N named tensors entering model.load_weights, to contrast with the
+        # sparse delta path ([DIAG] in _load_nan_masked_weights and [DIAG-DELTA]
+        # in _decode_and_apply). The dense seed SUCCEEDS; the delta (v>=1) crashes
+        # in copy_non_nan_ with dest(512,2048)!=src(2048,). The crash fires inside
+        # qwen3_5.py:load_fused_expert_weights, which loops
+        # `for expert_id in range(num_experts): curr = loaded_weight[expert_id]`
+        # and assumes loaded_weight is 3D-stacked [E,2N,K] (expert_id recovered
+        # from dim 0, NOT from the name). This dump answers whether the dense seed
+        # lands fused-expert names ("experts.gate_up_proj"/"experts.down_proj" with
+        # 3D [E,2N,K]) vs per-expert names ("experts.{idx}.gate_proj.weight" with
+        # 2D [N,K]), so the test machine can pin the name/shape contract
+        # difference between the two paths without a debugger attached.
+        try:
+            _dense_shapes = [(n, tuple(t.shape)) for n, t in named_tensors[:16]]
+            print(
+                f"[DIAG-DENSE _apply_dense_buckets] n_tensors={len(named_tensors)} "
+                f"first={_dense_shapes}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        # [DIAG-DENSE-EXPERT 2026-10-08] Same expert-filter rationale as
+        # [DIAG-EXPERT] in the delta path: dense-seed expert weights may trail
+        # attention/embedding, so also dump the first 8 expert-related names.
+        try:
+            _dense_expert = [
+                (n, tuple(t.shape))
+                for n, t in named_tensors
+                if any(k in n.lower() for k in ("gate_up_proj", "down_proj", "w13_weight", "w2_weight", "expert"))
+            ][:8]
+            if _dense_expert:
+                print(
+                    f"[DIAG-DENSE-EXPERT _apply_dense_buckets] expert_tensors={_dense_expert}",
+                    flush=True,
+                )
+        except Exception:
+            pass
         self.model.load_weights(named_tensors)
         try:
             moe_after = []
@@ -341,6 +379,38 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
     def _decode_and_apply(self, payload: list[tuple[str, torch.Tensor]]) -> None:
         """Decode one flush's named tensors into checkpoint patches and apply them."""
         encoding, patches = decode_delta_payload(payload)
+
+        # [DIAG-DELTA 2026-10-08] Sparse delta path (v>=1) -- dump the decoded
+        # patches' name/shape/values.numel/indices.numel BEFORE
+        # load_checkpoint_weight_patches applies them. copy_non_nan_
+        # (checkpoint_weight_patch.py) crashes inside the model's fused-expert
+        # loader (qwen3_5.py:load_fused_expert_weights) with
+        # dest(512,2048)!=src(2048,). That loader loops
+        # `for expert_id in range(num_experts): curr = loaded_weight[expert_id]`
+        # and assumes loaded_weight is 3D-stacked [E,2N,K]. A per-expert 2D [N,K]
+        # patch makes chunk(2,dim=-2) slice the N dim and [expert_id] slice a row
+        # -> 1D [K] -> shape mismatch. This dump answers whether the delta lands
+        # fused-expert names with 3D (the contract the fused loader expects) vs
+        # per-expert names with 2D, so the test machine can pin the contract
+        # violation. Paired with [DIAG-DENSE] (dense seed) and [DIAG] (apply
+        # entry) for a three-way dense-vs-delta contrast.
+        try:
+            _delta_patches = [
+                (
+                    p.name,
+                    tuple(p.shape),
+                    int(p.values.numel()),
+                    None if p.indices is None else int(p.indices.numel()),
+                )
+                for p in patches[:16]
+            ]
+            print(
+                f"[DIAG-DELTA _decode_and_apply] encoding={encoding} "
+                f"n_patches={len(patches)} first={_delta_patches}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
         if self._session_encoding is None:
             self._session_encoding = encoding

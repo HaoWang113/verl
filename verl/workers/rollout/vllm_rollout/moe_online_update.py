@@ -220,6 +220,20 @@ def prepare_expert_weights_for_online_update(layer: torch.nn.Module, window: Exp
     _assert_nz_inactive()
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
+    # [DIAG-WINDOW 2026-10-08] Log the runtime->checkpoint layout flip per layer.
+    # The sparse delta applies patches at checkpoint coordinates; if this flip is
+    # a no-op or wrong-orient, copy_non_nan_ writes into runtime-layout storage
+    # and the shape mismatch surfaces downstream. Pair with [DIAG] (apply entry)
+    # to confirm the live param shape matches the patch shape when the apply runs.
+    try:
+        logger.info(
+            "[DIAG-WINDOW prepare] layer=%s w13 runtime=%s -> ckpt=%s | w2 runtime=%s -> ckpt=%s",
+            type(layer).__name__,
+            tuple(w13.shape), tuple(w13.transpose(1, 2).shape),
+            tuple(w2.shape), tuple(w2.transpose(1, 2).shape),
+        )
+    except Exception:
+        pass
     # Build the checkpoint-layout copies first, then release the runtime
     # storages: transient overhead stays at this single layer's size.
     ckpt_w13 = w13.transpose(1, 2).contiguous()

@@ -53,6 +53,52 @@ def _load_nan_masked_weights(
     # Save the original copy_ so it can be restored after loading.
     original_copy = torch.Tensor.copy_
 
+    # [DIAG 2026-10-08] One-shot per-call dump of the patch shapes entering the
+    # sparse apply, plus the matching live-parameter shape when a name routes to
+    # a model parameter. The copy_non_nan_ shape mismatch fires inside the
+    # model's fused-expert loader (qwen3_5.py load_fused_expert_weights, which
+    # loops `range(num_experts)` slicing `loaded_weight[expert_id]`). This dump
+    # confirms whether the patch landed here as a per-expert 2D tensor (the
+    # steady case, which the loop mis-slices into a `[K]` row) vs. a stacked 3D
+    # tensor (the dense-seed case, which the loop slices correctly), so the test
+    # machine can verify the root-cause contract without a debugger attached.
+    try:
+        _patch_shapes = [(n, tuple(t.shape)) for n, t in weights[:8]]
+        _params = dict(model.named_parameters())
+        _param_shapes = []
+        for n, _t in _patch_shapes:
+            p = _params.get(n)
+            _param_shapes.append((n, None if p is None else tuple(p.shape)))
+        print(
+            f'[DIAG _load_nan_masked_weights] n_patches={len(weights)} '
+            f'first_patch_shapes={_patch_shapes} param_shapes={_param_shapes}',
+            flush=True,
+        )
+    except Exception:
+        pass
+
+    # [DIAG-EXPERT 2026-10-08] Expert weights usually trail attention/embedding
+    # in the patch stream, so the first-8 dump above may miss them. Filter to
+    # expert-related names (gate_up/down_proj or w13/w2) and print up to 8, so
+    # the test machine sees the expert patch name/shape + live-param shape even
+    # when experts are not in the first 8 patches of this chunk.
+    try:
+        _expert_patches = []
+        for n, t in weights:
+            nl = n.lower()
+            if any(k in nl for k in ("gate_up_proj", "down_proj", "w13_weight", "w2_weight", "expert")):
+                p = _params.get(n)
+                _expert_patches.append((n, tuple(t.shape), None if p is None else tuple(p.shape)))
+                if len(_expert_patches) >= 8:
+                    break
+        if _expert_patches:
+            print(
+                f'[DIAG-EXPERT _load_nan_masked_weights] expert_patches={_expert_patches}',
+                flush=True,
+            )
+    except Exception:
+        pass
+
     # Enforce the sparse-loader contract and preserve destination values where
     # the corresponding source is NaN.
     def copy_non_nan_(
