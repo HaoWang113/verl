@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -60,6 +61,13 @@ import torch
 from verl.workers.engine.spec import ShardSpec
 
 logger = logging.getLogger(__name__)
+
+# Id-less fused MoE HF names (e.g. qwen3_5's fused checkpoint format
+# '...mlp.experts.gate_up_proj'): legitimate for whole-layer 3D slots on the
+# dense seed, but a 2D per-expert slot under one carries no expert id on the
+# wire. Deliberate twin of delta_weight_transfer._FUSED_EXPERT_NAME_RE (the
+# engine layer must not import from the rollout layer; keep the two in sync).
+_FUSED_EXPERT_NAME_RE = re.compile(r"\.experts\.(gate_up_proj|gate_proj|up_proj|down_proj)(?:\.weight)?$")
 
 
 class _ProbeGroup:
@@ -193,6 +201,9 @@ class McoreParamExport:
     # GLOBAL slot table for this directory row (set by the index-build
     # exchange): identical on every rank of the row's merge group.
     slots: Optional[list] = None
+    # Whether the bridge mapping marks this parameter as an expert weight
+    # (drives the sparse-delta expert-name contract check at index build).
+    is_expert: bool = False
 
 
 def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -> list[McoreParamExport]:
@@ -243,6 +254,7 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
                     spec=ShardSpec(full_shape=(0,), place=0, gather_group=world, contributes=False),
                     probe=None,
                     module=None,
+                    is_expert=bool(getattr(mapping, "is_expert", False)),
                 )
             )
             continue
@@ -290,6 +302,7 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
                 spec=spec,
                 probe=make_probe(mapping, module),
                 module=module,
+                is_expert=bool(getattr(mapping, "is_expert", False)),
             )
         )
 
@@ -308,6 +321,36 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
             unowned[:8],
         )
         index = [rec for rec in index if rec.slots is not None]
+
+    # [FAIL-LOUD 2026-10-09] Sparse-delta expert-name contract check. An
+    # expert row whose probe emits an id-less fused HF name (qwen3_5's fused
+    # checkpoint format, '...mlp.experts.gate_up_proj') with a 2D per-expert
+    # shape cannot carry the expert id on the wire. The dense seed tolerates
+    # such names -- the bridge's real export stacks whole-layer 3D fused
+    # tensors and the rollout's fused loader slices them -- but the steady
+    # delta collapses every local expert into the same slot: the probe stub's
+    # dict keying keeps one output per name, so all but one expert's delta is
+    # silently dropped, and the receiver's fused loader mis-slices the 2D
+    # survivor (observed on the 4+2 NPU cluster, raysubmit_UMB8tQQKKLLLW1Qf:
+    # wire patch '...experts.gate_up_proj' shape (1024, 2048) = [2N, K],
+    # N=512, crash dest (512, 2048) != src (2048,)). Fail here -- at index
+    # build, right after the seed sync and BEFORE the training step -- with
+    # the fix pointer. Whole-layer 3D fused slots and per-expert names that
+    # carry the global expert id pass untouched.
+    for rec in index:
+        if not rec.is_expert or rec.slots is None:
+            continue
+        for slot_name, slot_shape in rec.slots:
+            if len(slot_shape) == 2 and _FUSED_EXPERT_NAME_RE.search(slot_name):
+                raise NotImplementedError(
+                    f"{rec.megatron_name}: the bridge's MoE conversion emits the id-less fused HF name "
+                    f"{slot_name!r} with a per-expert 2D shape {tuple(slot_shape)}. Sparse delta export requires "
+                    "per-expert HF names carrying the GLOBAL expert id ('<prefix>.experts.{global_id}.gate_up_proj' "
+                    "[2N, K], '.gate_proj'/'.up_proj' [N, K], or '.down_proj' [K, N]) -- without it the expert id "
+                    "is not on the wire, every local expert collapses into one slot, and the deltas are silently "
+                    "dropped or mis-applied. Fix the model's Megatron-Bridge mapping to bind per-expert names for "
+                    "the delta path; the dense seed's whole-layer 3D fused tensors are unaffected."
+                )
     return index
 
 

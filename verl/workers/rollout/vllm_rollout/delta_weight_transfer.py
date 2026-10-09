@@ -21,6 +21,7 @@ checkpoint names, packed weights, and TP slicing.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,11 @@ import vllm
 from verl.utils.device import get_device_name
 
 logger = logging.getLogger(__name__)
+
+# Id-less fused expert checkpoint names (qwen3_5-style fused loader inputs):
+# '...mlp.experts.gate_up_proj' / '...mlp.experts.down_proj' with NO expert id.
+# A 2D patch under one of these names has no expert id anywhere on the wire.
+_FUSED_EXPERT_NAME_RE = re.compile(r"\.experts\.(gate_up_proj|gate_proj|up_proj|down_proj)(?:\.weight)?$")
 
 try:
     from vllm.config.weight_transfer import WeightTransferConfig
@@ -433,13 +439,15 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
 
         _, load_checkpoint_weight_patches = _checkpoint_patch_api()
         # Sparse per-expert MoE patches bypass model.load_weights: the fused-expert
-        # loader (qwen3_5.py:load_fused_expert_weights) assumes 3D-stacked [E,2N,K]
-        # tensors and the mapper maps per-expert names back to fused names, so a
-        # per-expert 2D [N,K] patch crashes in copy_non_nan_ (dest (512,2048) !=
-        # src (2048,)). apply_expert_patch_direct writes them into the
-        # checkpoint-layout live parameters (the sparse window already flipped
-        # them), bypassing the fused loader. Non-expert patches go through the
-        # normal loader path.
+        # loader (qwen3_5.py:load_fused_expert_weights) only accepts whole-layer
+        # 3D [E, 2N, K] tensors under the id-less fused name 'experts.gate_up_proj'
+        # (chunk(2, dim=-2) then loaded_weight[expert_id]). Per-expert patches
+        # (confirmed on the 4+2 cluster, raysubmit_UMB8tQQKKLLLW1Qf: name
+        # '...experts.gate_up_proj' shape (1024, 2048) = [N, K], N=1024/K=2048)
+        # are mis-sliced into 1D rows there -> copy_non_nan_ dest (512, 2048) !=
+        # src (2048,). apply_expert_patch_direct writes them into the
+        # checkpoint-layout live parameters, bypassing the fused loader.
+        # Non-expert patches go through the normal loader path.
         from verl.workers.rollout.vllm_rollout.moe_online_update import apply_expert_patch_direct
 
         remaining_patches = []
@@ -458,6 +466,23 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 n_expert_applied,
                 len(remaining_patches),
             )
+        # [FAIL-LOUD 2026-10-09] An id-less fused expert name ('...experts.
+        # gate_up_proj' / '...experts.down_proj', no expert id) with a 2D shape
+        # means the trainer-side delta export collapsed the per-expert names:
+        # the expert id (and the gate/up half) is not encoded anywhere on the
+        # wire, so NO receiver can apply the patch. Fail loud with the fix
+        # pointer instead of mis-slicing inside the fused loader (whole-layer
+        # 3D fused tensors are legit and still take the loader path below).
+        for patch in remaining_patches:
+            if len(patch.shape) == 2 and _FUSED_EXPERT_NAME_RE.search(patch.name):
+                raise NotImplementedError(
+                    f"delta wire carries fused-name expert patch {patch.name!r} with per-expert shape "
+                    f"{tuple(patch.shape)}: the expert id is not on the wire, so no receiver can apply it. "
+                    "The trainer-side MoE delta export must emit per-expert HF names "
+                    "(default_moe_param_handler: '...mlp.experts.{id}.gate_proj.weight' [N, K], up_proj, "
+                    "down_proj, or '...mlp.experts.{id}.gate_up_proj' [2N, K]); qwen3_5.load_weights' fused "
+                    "branch only accepts whole-layer 3D [num_experts, 2N, K] tensors under 'experts.gate_up_proj'."
+                )
         if remaining_patches:
             # The trusted producer emits every changed position at most once;
             # skip vLLM's sort-based duplicate check on the rollout GPU.

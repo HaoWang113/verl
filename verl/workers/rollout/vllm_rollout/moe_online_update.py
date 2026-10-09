@@ -51,9 +51,34 @@ _LIST_SPLIT_ATTRS = ("w13_weight_list", "w2_weight_list")
 
 @dataclass
 class ExpertLayoutWindow:
-    """Layers whose expert weights currently sit at checkpoint layout."""
+    """Expert-weight parameters currently held at checkpoint layout.
 
-    flipped_layers: list[torch.nn.Module] = field(default_factory=list)
+    Tracks the ``(layer, param_name)`` pairs the open pass actually flipped.
+    Params that already sat at checkpoint layout (qwen3.5 on vllm-ascend
+    0.23.0rc1 -- the host never transposes it) are NOT flipped and must NOT be
+    transposed back at close time.
+    """
+
+    flipped: list[tuple[torch.nn.Module, str]] = field(default_factory=list)
+
+
+def _module_hidden_size(layer: torch.nn.Module) -> int:
+    """The module's hidden size, used as the runtime-layout discriminator.
+
+    Mirrors the signature verl's NPU weight-loader wrapper relies on
+    (``verl.utils.vllm.npu_vllm_patch.vllm_v013_weight_loader_method_wrapper``):
+    a w13 param with ``shape[1] == hidden_size`` (w2 with ``shape[2] ==
+    hidden_size``) is in vllm-ascend's transposed RUNTIME layout; otherwise it
+    already sits at checkpoint layout.
+    """
+    hidden = getattr(layer, "hidden_size", None)
+    if not isinstance(hidden, int) or hidden <= 0:
+        raise NotImplementedError(
+            f"{type(layer).__name__} exposes no usable hidden_size attribute; the sparse expert layout window "
+            "cannot decide whether expert weights sit at runtime or checkpoint layout. Fail loud instead of "
+            "guessing (the NPU weight-loader wrapper requires the same attribute)."
+        )
+    return hidden
 
 
 def _installed_vllm_ascend_version() -> str:
@@ -215,44 +240,65 @@ def _assert_layer_supported(layer: torch.nn.Module) -> None:
 
 
 def prepare_expert_weights_for_online_update(layer: torch.nn.Module, window: ExpertLayoutWindow) -> None:
-    """Flip one layer's expert weights: runtime [E, K, 2N] -> checkpoint [E, 2N, K]."""
+    """Flip this layer's expert weights to checkpoint layout -- ONLY the params
+    that currently sit at vllm-ascend's transposed runtime layout.
+
+    Runtime layouts (transposing hosts, post ``process_weights_after_loading``):
+    w13 ``[E, K, 2N]`` / w2 ``[E, N, K]``, detected by the same signature the
+    NPU weight-loader wrapper uses (dim-1 == hidden_size for w13, dim-2 ==
+    hidden_size for w2). Checkpoint layouts: w13 ``[E, 2N, K]`` / w2
+    ``[E, K, N]`` (TP-narrowed variants included). qwen3.5 on vllm-ascend
+    0.23.0rc1 is NOT transposed by the host (the loader carries the comment
+    "qwen3.5 no need to transpose"), so its live params already sit at
+    checkpoint layout at window open -- observed on the 4+2 cluster as w13
+    (128, 1024, 2048) = [E, 2N/TP, K]. Unconditionally flipping such a param
+    (a) puts the live parameter into runtime layout, (b) makes dim-1 equal
+    hidden_size, which arms verl's own npu_vllm_patch wrapper to transpose
+    param.data BACK on the first weight_loader call (observed: the crash dest
+    (512, 2048) is the un-flipped w1 slot), and (c) leaves the window-close
+    restore double-transposing. So: flip only what the runtime signature
+    matches, record it, and restore exactly that.
+    """
     _assert_layer_supported(layer)
     _assert_nz_inactive()
+    hidden = _module_hidden_size(layer)
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
-    # [DIAG-WINDOW 2026-10-08] Log the runtime->checkpoint layout flip per layer.
-    # The sparse delta applies patches at checkpoint coordinates; if this flip is
-    # a no-op or wrong-orient, copy_non_nan_ writes into runtime-layout storage
-    # and the shape mismatch surfaces downstream. Pair with [DIAG] (apply entry)
-    # to confirm the live param shape matches the patch shape when the apply runs.
+    w13_flipped = w13.shape[1] == hidden
+    w2_flipped = w2.shape[2] == hidden
+    # [DIAG-WINDOW 2026-10-08] Log the per-param flip decision at window open.
+    # "no-flip" means the live param already sits at checkpoint layout (the
+    # qwen3.5 case); flipping it would fight the npu_vllm_patch wrapper and
+    # double-transpose at close. Pair with [DIAG-DELTA]/[DIAG-EXPERT] on the
+    # apply path to confirm patch coordinates match the live layout.
     try:
         logger.warning(
-            "[DIAG-WINDOW prepare] layer=%s w13 runtime=%s -> ckpt=%s | w2 runtime=%s -> ckpt=%s",
+            "[DIAG-WINDOW prepare] layer=%s hidden=%d w13=%s -> %s | w2=%s -> %s",
             type(layer).__name__,
-            tuple(w13.shape), tuple(w13.transpose(1, 2).shape),
-            tuple(w2.shape), tuple(w2.transpose(1, 2).shape),
+            hidden,
+            tuple(w13.shape),
+            tuple(w13.transpose(1, 2).shape) if w13_flipped else "no-flip (already checkpoint layout)",
+            tuple(w2.shape),
+            tuple(w2.transpose(1, 2).shape) if w2_flipped else "no-flip (already checkpoint layout)",
         )
     except Exception:
         pass
-    # Build the checkpoint-layout copies first, then release the runtime
-    # storages: transient overhead stays at this single layer's size.
-    ckpt_w13 = w13.transpose(1, 2).contiguous()
-    ckpt_w2 = w2.transpose(1, 2).contiguous()
-    _replace_parameter(layer, "w13_weight", ckpt_w13)
-    _replace_parameter(layer, "w2_weight", ckpt_w2)
+    # Build the checkpoint-layout copy first, then rebind: transient overhead
+    # stays at this single layer's size.
+    if w13_flipped:
+        _replace_parameter(layer, "w13_weight", w13.transpose(1, 2).contiguous())
+        window.flipped.append((layer, "w13_weight"))
+    if w2_flipped:
+        _replace_parameter(layer, "w2_weight", w2.transpose(1, 2).contiguous())
+        window.flipped.append((layer, "w2_weight"))
     del w13, w2
-    window.flipped_layers.append(layer)
 
 
-def restore_expert_weights_after_online_update(layer: torch.nn.Module) -> None:
-    """Replay the load-time transform for one flipped layer (ND main path)."""
-    w13 = layer.w13_weight.data
-    w2 = layer.w2_weight.data
-    runtime_w13 = w13.transpose(1, 2).contiguous()
-    runtime_w2 = w2.transpose(1, 2).contiguous()
-    _replace_parameter(layer, "w13_weight", runtime_w13)
-    _replace_parameter(layer, "w2_weight", runtime_w2)
-    del w13, w2
+def restore_expert_param_after_online_update(layer: torch.nn.Module, param_name: str) -> None:
+    """Replay the load-time transform for one flipped expert param (ND main path)."""
+    data = getattr(layer, param_name).data
+    _replace_parameter(layer, param_name, data.transpose(1, 2).contiguous())
+    del data
 
 
 def open_expert_layout_window(model: torch.nn.Module) -> ExpertLayoutWindow | None:
@@ -278,26 +324,38 @@ def open_expert_layout_window(model: torch.nn.Module) -> ExpertLayoutWindow | No
 
 
 def close_expert_layout_window(window: ExpertLayoutWindow) -> None:
-    """Close the window: replay load-time transforms for the flipped layers."""
-    for layer in window.flipped_layers:
-        restore_expert_weights_after_online_update(layer)
-    window.flipped_layers.clear()
+    """Close the window: replay the load-time transform for exactly the params
+    the open pass flipped. Params that already sat at checkpoint layout were
+    never flipped and must not be transposed back."""
+    for layer, param_name in window.flipped:
+        restore_expert_param_after_online_update(layer, param_name)
+    window.flipped.clear()
 
 
 # ---- per-expert direct-apply (bypass model.load_weights fused-expert loader) ----
-# The fused-expert loader (e.g. qwen3_5.py:load_fused_expert_weights) loops
-# ``for expert_id in range(num_experts): curr = loaded_weight[expert_id]`` and
-# assumes loaded_weight is 3D-stacked [E,2N,K] (expert_id from dim 0, NOT from
-# the name). Dense seed (v=0) lands a whole layer's experts in one
-# model.load_weights call, so AutoWeightsLoader groups+stacks them into 3D and
-# the fused loader slices correctly. Sparse delta (v>=1) ships per-expert 2D
-# [N,K] patches per flush; the mapper maps the per-expert name back to the
-# fused name, but the 2D tensor cannot be stacked -> the fused loader slices a
-# 1D row -> copy_non_nan_ shape mismatch (dest (512,2048) != src (2048,)).
-# This path writes per-expert patches directly into the checkpoint-layout live
-# parameters (the sparse window already flipped them to [E,2N,K]/[E,K,N]),
+# CONFIRMED on the 4+2 NPU cluster (raysubmit_UMB8tQQKKLLLW1Qf, 2026-10-09):
+# the steady delta wire carries PER-EXPERT MoE patches -- single-expert shapes
+# like [N, K] (one gate or up half; Qwen3.5-35B-A3B: E=128, N=1024, K=2048,
+# live w13 [E, 2N/TP, K] = (128, 1024, 2048) at TP=2) -- under per-expert HF
+# names ('...mlp.experts.{id}.gate_proj.weight', what verl's
+# default_moe_param_handler emits) or per-expert fused names
+# ('...mlp.experts.{id}.gate_up_proj' [2N, K], gpt_oss streamed style).
+#
+# qwen3_5.load_weights' fused branch accepts ONLY whole-layer 3D [E, 2N, K]
+# tensors under the id-less fused name 'experts.gate_up_proj' (it does
+# chunk(2, dim=-2) then loops `loaded_weight[expert_id]`). A 2D per-expert
+# patch that reaches it is mis-sliced into a 1D row -> copy_non_nan_ shape
+# mismatch (dest (512, 2048) != src (2048,)). This path parses the expert id
+# from the name and writes the patch directly into the checkpoint-layout live
+# parameters (the sparse window guarantees that layout at apply time),
 # bypassing the fused loader entirely. TP sharding is derived from the live
 # parameter shape vs the patch shape, so no vllm_config plumbing is needed.
+#
+# An id-less FUSED name ('...experts.gate_up_proj', no expert id) with a 2D
+# shape is a sender contract violation: the expert id (and the gate/up half)
+# is not encoded anywhere on the wire, so NO receiver can apply it. The
+# receiver fails loud on that case (see _decode_and_apply) instead of
+# mis-slicing inside the fused loader.
 
 _EXPERT_PATCH_RE = None
 
@@ -308,7 +366,8 @@ def _expert_patch_name_regex():
         import re
 
         _EXPERT_PATCH_RE = re.compile(
-            r"^(?P<layer>.+\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)(?:\.weight)?$"
+            r"^(?P<layer>.+\.experts)\.(?P<eid>\d+)\."
+            r"(?P<proj>gate_up_proj|gate_proj|up_proj|down_proj)(?:\.weight)?$"
         )
     return _EXPERT_PATCH_RE
 
@@ -325,16 +384,18 @@ def parse_expert_patch_name(name: str):
 def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, values, indices) -> bool:
     """Apply one sparse per-expert patch directly into the checkpoint-layout live
     parameter, bypassing ``model.load_weights``. Returns ``True`` if the patch
-    was applied here, ``False`` if it is not a per-expert patch (caller should
-    fall back to the normal loader path).
+    was applied here (or intentionally skipped on this rank), ``False`` if it is
+    not a per-expert patch (caller should fall back to the normal loader path).
 
-    The sparse window must already be open (parameters at checkpoint layout):
-    ``w13_weight`` = [E, 2N, K], ``w2_weight`` = [E, K, N] (TP-narrowed). The
-    patch carries per-expert checkpoint coordinates: ``shape`` = [N, K] (gate/up)
-    or [K, N] (down), ``indices`` = int32 flat positions into ``shape``, ``values``
-    = the changed elements. We densify into a NaN-masked [N,K]/[K,N] tensor,
-    TP-narrow it to match the live parameter's per-expert slot, then NaN-masked
-    copy into ``w13_weight[e, slot, :]`` / ``w2_weight[e]``."""
+    The sparse window guarantees the live parameters sit at checkpoint layout
+    at apply time: ``w13_weight`` = [E, 2N, K], ``w2_weight`` = [E, K, N]
+    (TP-narrowed variants included). The patch carries per-expert checkpoint
+    coordinates: ``shape`` = [N, K] (gate_proj/up_proj), [2N, K]
+    (gate_up_proj, gate rows first) or [K, N] (down_proj), ``indices`` = int32
+    flat positions into ``shape``, ``values`` = the changed elements. We
+    densify into a NaN-masked tensor, TP-narrow it to this rank's slice, then
+    NaN-masked copy into the per-expert slot of ``w13_weight``/``w2_weight``.
+    """
     parsed = parse_expert_patch_name(name)
     if parsed is None:
         return False
@@ -369,7 +430,7 @@ def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, v
     import math
 
     numel = int(math.prod(shape))
-    # Densify: full [N,K]/[K,N] checkpoint tensor, NaN at unchanged positions.
+    # Densify: full checkpoint tensor, NaN at unchanged positions.
     flat = torch.full((numel,), float("nan"), dtype=dtype, device=values.device)
     if indices is not None and int(indices.numel()):
         flat.index_copy_(
@@ -382,35 +443,68 @@ def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, v
         flat = values.to(dtype=dtype, device=flat.device)
     checkpoint_tensor = flat.view(shape)
 
-    # w13 checkpoint layout [E, 2N, K]: gate_proj (w1) -> [e, :N, :], up_proj (w3)
-    # -> [e, N:, :]; w2 checkpoint layout [E, K, N]: down_proj -> [e, :, :].
-    # The live parameter is already TP-sharded, so select the per-expert slot
-    # FIRST and then narrow the densified checkpoint tensor to that slot's shape
-    # (the slot's shape encodes the TP shard: 2N->2N/TP, K->K/TP, N->N/TP).
-    if proj == "gate_proj":
+    # Layout guards: the write below assumes checkpoint layout. If the live
+    # param still matches the RUNTIME signature (npu_vllm_patch: dim-1 ==
+    # hidden for w13, dim-2 == hidden for w2), the window did not normalize it
+    # -- fail loud instead of writing transposed garbage.
+    hidden = _module_hidden_size(target_module)
+    if w13.shape[2] != hidden:
+        raise NotImplementedError(
+            f"apply_expert_patch_direct({name}): live w13 {tuple(w13.shape)} is not at checkpoint layout "
+            f"[E, 2N, K] (dim-2 should be hidden_size={hidden}); refusing to write transposed coordinates."
+        )
+    if w2.shape[1] != hidden:
+        raise NotImplementedError(
+            f"apply_expert_patch_direct({name}): live w2 {tuple(w2.shape)} is not at checkpoint layout "
+            f"[E, K, N] (dim-1 should be hidden_size={hidden}); refusing to write transposed coordinates."
+        )
+    n_experts_local = w13.shape[0]
+    if not 0 <= expert_id < n_experts_local:
+        raise NotImplementedError(
+            f"apply_expert_patch_direct({name}): expert_id {expert_id} out of range for the local expert "
+            f"stack ({n_experts_local} experts); expert_map_manager is "
+            f"{'absent' if expert_map_manager is None else 'inconsistent with the live parameter'}."
+        )
+
+    # w13 checkpoint layout [E, 2N, K]: gate (w1) -> [e, :N/TP, :], up (w3) ->
+    # [e, N/TP:, :]; w2 checkpoint layout [E, K, N]: down -> [e, :, :]. The
+    # live parameter is already TP-sharded, so select the per-expert slot FIRST
+    # and then narrow the densified checkpoint tensor to that slot's shape.
+    if proj in ("gate_proj", "up_proj", "gate_up_proj"):
         slot_full_n = w13.shape[1] // 2
-        dest = w13.data[expert_id, :slot_full_n, :]
-    elif proj == "up_proj":
-        slot_full_n = w13.shape[1] // 2
-        dest = w13.data[expert_id, slot_full_n:, :]
+        if proj == "gate_proj":
+            writes = [(checkpoint_tensor, w13.data[expert_id, :slot_full_n, :])]
+        elif proj == "up_proj":
+            writes = [(checkpoint_tensor, w13.data[expert_id, slot_full_n:, :])]
+        else:  # gate_up_proj [2N, K]: gate rows first, then up rows
+            half = checkpoint_tensor.shape[0] // 2
+            writes = [
+                (checkpoint_tensor[:half], w13.data[expert_id, :slot_full_n, :]),
+                (checkpoint_tensor[half:], w13.data[expert_id, slot_full_n:, :]),
+            ]
     else:  # down_proj
-        dest = w2.data[expert_id]
+        writes = [(checkpoint_tensor, w2.data[expert_id])]
 
-    # Narrow the densified checkpoint tensor to the live slot's per-rank shape.
-    # checkpoint_tensor dims (before TP): gate/up [N_full, K_full], down [K_full, N_full].
-    # dest dims (after TP): gate/up [N_full/TP, K_full/TP], down [K_full/TP, N_full/TP].
-    # Each dim where checkpoint_tensor is larger than dest is a TP-sharded dim;
-    # pick this rank's slice using the module's tp_rank.
-    tp_rank = getattr(target_module, "tp_rank", 0)
-    src = checkpoint_tensor
-    for d in range(src.ndim):
-        if src.shape[d] > dest.shape[d]:
-            per_rank = dest.shape[d]
-            start = per_rank * tp_rank
-            src = src.narrow(d, start, per_rank)
-    src = src.to(dtype=dest.dtype, device=dest.device)
-    if dest.shape != src.shape:
-        return False
+    # Narrow each densified checkpoint tensor to the live slot's per-rank shape.
+    # checkpoint_tensor dims (before TP): gate/up [N_full, K_full], gate_up
+    # [2N_full, K_full], down [K_full, N_full]. dest dims (after TP): the same
+    # with the sharded dims divided. Each dim where the source is larger than
+    # the dest is a TP-sharded dim; pick this rank's slice.
+    tp_rank = getattr(target_module, "tp_rank", None)
+    if not isinstance(tp_rank, int):
+        from vllm.distributed import get_tensor_model_parallel_rank
 
-    torch.where(torch.isnan(src), dest, src, out=dest)
+        tp_rank = get_tensor_model_parallel_rank()
+
+    for src, dest in writes:
+        for d in range(src.ndim):
+            if src.shape[d] > dest.shape[d]:
+                per_rank = dest.shape[d]
+                start = per_rank * tp_rank
+                src = src.narrow(d, start, per_rank)
+        src = src.to(dtype=dest.dtype, device=dest.device)
+        if dest.shape != src.shape:
+            return False
+
+        torch.where(torch.isnan(src), dest, src, out=dest)
     return True
