@@ -335,11 +335,15 @@ def close_expert_layout_window(window: ExpertLayoutWindow) -> None:
 # ---- per-expert direct-apply (bypass model.load_weights fused-expert loader) ----
 # CONFIRMED on the 4+2 NPU cluster (raysubmit_UMB8tQQKKLLLW1Qf, 2026-10-09):
 # the steady delta wire carries PER-EXPERT MoE patches -- single-expert shapes
-# like [N, K] (one gate or up half; Qwen3.5-35B-A3B: E=128, N=1024, K=2048,
-# live w13 [E, 2N/TP, K] = (128, 1024, 2048) at TP=2) -- under per-expert HF
-# names ('...mlp.experts.{id}.gate_proj.weight', what verl's
-# default_moe_param_handler emits) or per-expert fused names
+# like [2N, K] (Qwen3.5-35B-A3B: E=128, N=512, K=2048, live w13 [E, 2N, K] =
+# (128, 1024, 2048) as observed on the rollout ranks, expert dims unsharded)
+# -- under per-expert HF names ('...mlp.experts.{id}.gate_proj.weight', what
+# verl's default_moe_param_handler emits) or per-expert fused names
 # ('...mlp.experts.{id}.gate_up_proj' [2N, K], gpt_oss streamed style).
+# Layout reading verified by the observed crash arithmetic: the 2D (1024,
+# 2048) fused patch made qwen3_5's fused loader chunk(2, dim=-2) -> (512,
+# 2048) w1 half, then loaded_weight[expert_id] sliced a single (2048,) row
+# toward the (512, 2048) w1 slot -- hence dest (512, 2048) != src (2048,).
 #
 # qwen3_5.load_weights' fused branch accepts ONLY whole-layer 3D [E, 2N, K]
 # tensors under the id-less fused name 'experts.gate_up_proj' (it does

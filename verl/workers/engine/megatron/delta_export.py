@@ -69,6 +69,12 @@ logger = logging.getLogger(__name__)
 # engine layer must not import from the rollout layer; keep the two in sync).
 _FUSED_EXPERT_NAME_RE = re.compile(r"\.experts\.(gate_up_proj|gate_proj|up_proj|down_proj)(?:\.weight)?$")
 
+# Megatron per-expert MoE parameter suffix ('...mlp.experts.linear_fc1.weight0'
+# .. '.weight15'): the digit is the EP-LOCAL expert index (GroupedMLP-style
+# per-expert flattened weights). Used to recover the GLOBAL expert id that
+# fused-name bridge mappings (qwen3_5) leave off the HF name.
+_MCORE_EXPERT_IDX_RE = re.compile(r"\.weight(\d+)$")
+
 
 class _ProbeGroup:
     """Size/rank-faithful stand-in for a process group on probe copies: value
@@ -204,6 +210,74 @@ class McoreParamExport:
     # Whether the bridge mapping marks this parameter as an expert weight
     # (drives the sparse-delta expert-name contract check at index build).
     is_expert: bool = False
+    # GLOBAL expert id for per-expert rows whose bridge mapping emits the
+    # id-less fused HF name (qwen3_5's FusedGated/FusedExpertMapping): bound
+    # at index build from the megatron param's EP-local 'weight{i}' suffix
+    # (see _bind_expert_global_ids); None leaves the probe's names untouched.
+    expert_gid: Optional[int] = None
+
+
+def _bind_expert_global_ids(index: list[McoreParamExport], ep_rank: int) -> None:
+    """Resolve GLOBAL expert ids for per-expert rows whose bridge mapping emits
+    id-less fused HF names (qwen3_5's FusedGatedExpertMapping / FusedExpertMapping:
+    hf_param '...experts.gate_up_proj' / '...experts.down_proj').
+
+    The probe contract (see make_probe) is that each rank emits its own local
+    experts under the hf name bound with the GLOBAL expert id -- per-expert
+    mappings (glm4.5 and the standard MoE zoo) satisfy it at task construction.
+    The fused mappings do not: ``megatron_to_hf`` on one 'linear_fc1.weight{i}'
+    shard returns {fused_name: [2N, K]} with correct values/orientation but no
+    expert id, so every local expert would collapse into the same slot at the
+    etp x ep merge (observed: raysubmit_sHZUTh4setzRJ5GP, guard fired on
+    'language_model.decoder.layers.0.mlp.experts.linear_fc1.weight0'). Recover
+    the id from the megatron param name: '...weight{i}' carries the EP-LOCAL
+    index, and the global id follows the contiguous EP block layout shared by
+    the bridge's own rank-major fused export (the dense seed's [E, 2N, K]
+    assembly) and verl's veomni expert stack (veomni/utils.py:
+    ``ep_rank * n_local_experts``): gid = ep_rank * n_local + i.
+
+    A suffix set matching neither the local run {0..n-1} nor this rank's
+    contiguous global block fails loud -- silently routing experts to wrong
+    ids is the one failure this must never produce.
+    """
+    groups: dict[str, list[tuple[int, McoreParamExport]]] = {}
+    for rec in index:
+        if rec.param is None or not rec.is_expert:
+            continue
+        m = _MCORE_EXPERT_IDX_RE.search(rec.megatron_name)
+        if m is None:
+            continue
+        groups.setdefault(rec.megatron_name[: m.start()], []).append((int(m.group(1)), rec))
+    if not groups:
+        return
+    n_rows = 0
+    for base in sorted(groups):
+        items = groups[base]
+        suffixes = sorted(suffix for suffix, _ in items)
+        n = len(suffixes)
+        if suffixes == list(range(n)):
+            offset = ep_rank * n
+        elif suffixes == list(range(ep_rank * n, ep_rank * n + n)):
+            # already-global suffixes on this rank; rank 0 is indistinguishable
+            # between the two conventions and needs no offset either way.
+            offset = 0
+        else:
+            raise NotImplementedError(
+                f"{base}: cannot derive global expert ids from per-expert suffixes {suffixes} "
+                f"(ep_rank={ep_rank}): expected the EP-local run 0..{n - 1} or this rank's "
+                f"contiguous global block {ep_rank * n}..{ep_rank * n + n - 1}. Sparse expert "
+                "delta export refuses to guess the expert routing."
+            )
+        for suffix, rec in items:
+            rec.expert_gid = offset + suffix
+        n_rows += n
+    logger.warning(
+        "delta export: bound global expert ids on %d per-expert row(s) across %d group(s) (ep_rank=%d); "
+        "id-less fused probe outputs will be re-keyed to '...experts.{gid}.<proj>'",
+        n_rows,
+        len(groups),
+        ep_rank,
+    )
 
 
 def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -> list[McoreParamExport]:
@@ -306,6 +380,10 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
             )
         )
 
+    # Bind expert global ids BEFORE the slot-table exchange: the exchange
+    # probes every owned row once, and the re-key in mcore_hf_delta_entry
+    # must shape the slot names the tables (and the steady entries) carry.
+    _bind_expert_global_ids(index, mpu.get_expert_model_parallel_rank())
     _exchange_slot_tables(index, slot_cache)
     # a row with an empty union has no owner on ANY rank: the bridge skipped
     # it everywhere (no mapping / missing HF key), so it is outside the
@@ -333,10 +411,13 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
     # silently dropped, and the receiver's fused loader mis-slices the 2D
     # survivor (observed on the 4+2 NPU cluster, raysubmit_UMB8tQQKKLLLW1Qf:
     # wire patch '...experts.gate_up_proj' shape (1024, 2048) = [2N, K],
-    # N=512, crash dest (512, 2048) != src (2048,)). Fail here -- at index
-    # build, right after the seed sync and BEFORE the training step -- with
-    # the fix pointer. Whole-layer 3D fused slots and per-expert names that
-    # carry the global expert id pass untouched.
+    # N=512, crash dest (512, 2048) != src (2048,)). Rows whose megatron name
+    # carries a parseable per-expert suffix ('...weight{i}') are now re-keyed
+    # to per-expert HF names with the GLOBAL expert id before this check
+    # (see _bind_expert_global_ids); what remains here is the residual class
+    # whose expert id cannot be recovered from the megatron name. Whole-layer
+    # 3D fused slots and per-expert names that carry the global expert id
+    # pass untouched.
     for rec in index:
         if not rec.is_expert or rec.slots is None:
             continue
@@ -348,8 +429,10 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
                     "per-expert HF names carrying the GLOBAL expert id ('<prefix>.experts.{global_id}.gate_up_proj' "
                     "[2N, K], '.gate_proj'/'.up_proj' [N, K], or '.down_proj' [K, N]) -- without it the expert id "
                     "is not on the wire, every local expert collapses into one slot, and the deltas are silently "
-                    "dropped or mis-applied. Fix the model's Megatron-Bridge mapping to bind per-expert names for "
-                    "the delta path; the dense seed's whole-layer 3D fused tensors are unaffected."
+                    "dropped or mis-applied. Rows with a parseable '...weight{i}' megatron suffix are re-keyed "
+                    "(see _bind_expert_global_ids); this one is not, so its expert id cannot be recovered. Fix "
+                    "the model's Megatron-Bridge mapping to bind per-expert names for the delta path; the dense "
+                    "seed's whole-layer 3D fused tensors are unaffected."
                 )
     return index
 
@@ -441,6 +524,31 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
         buf.view(-1)[lidx] = lval
 
     outs = rec.probe.megatron_to_hf(buf, rec.module)
+
+    if rec.expert_gid is not None:
+        # Fused-name expert row (qwen3_5's FusedGatedExpertMapping): re-key the
+        # id-less fused output to the per-expert HF name carrying the GLOBAL
+        # expert id -- the naming contract every other expert mapping satisfies
+        # at task construction and the etp x ep slot merge relies on. Values
+        # and orientation are already final HF coordinates (observed shard:
+        # [2N, K] gate-rows-first for gate_up_proj, [K, N] for down_proj);
+        # only the dict key was wrong. The re-keyed slot must be 2D per-expert
+        # checkpoint layout -- anything else fails loud rather than mis-routing.
+        gid = rec.expert_gid
+        rekeyed: dict = {}
+        for hf_name, hf_tensor in outs.items():
+            m = _FUSED_EXPERT_NAME_RE.search(hf_name)
+            if m is None:
+                rekeyed[hf_name] = hf_tensor
+                continue
+            if hf_tensor.dim() != 2:
+                raise NotImplementedError(
+                    f"{rec.megatron_name}: fused expert slot {hf_name!r} emitted a {hf_tensor.dim()}D tensor "
+                    f"{tuple(hf_tensor.shape)}; the per-expert re-key contract is 2D checkpoint layout "
+                    "([2N, K] gate_up_proj / [N, K] gate|up_proj / [K, N] down_proj)."
+                )
+            rekeyed[f"{hf_name[: m.start()]}.experts.{gid}.{m.group(1)}"] = hf_tensor
+        outs = rekeyed
 
     key = rec.megatron_name
     slots = rec.slots if rec.slots is not None else slot_cache.get(key)

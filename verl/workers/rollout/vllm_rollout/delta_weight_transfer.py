@@ -392,9 +392,9 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         # loader (qwen3_5.py:load_fused_expert_weights) with
         # dest(512,2048)!=src(2048,). That loader loops
         # `for expert_id in range(num_experts): curr = loaded_weight[expert_id]`
-        # and assumes loaded_weight is 3D-stacked [E,2N,K]. A per-expert 2D [N,K]
-        # patch makes chunk(2,dim=-2) slice the N dim and [expert_id] slice a row
-        # -> 1D [K] -> shape mismatch. This dump answers whether the delta lands
+        # and assumes loaded_weight is 3D-stacked [E,2N,K]. A per-expert 2D [2N,K]
+        # patch makes chunk(2,dim=-2) halve it to [N,K] and [expert_id] then slice
+        # a single [K] row -> dest [N,K] != src [K]. This dump answers whether the delta lands
         # fused-expert names with 3D (the contract the fused loader expects) vs
         # per-expert names with 2D, so the test machine can pin the contract
         # violation. Paired with [DIAG-DENSE] (dense seed) and [DIAG] (apply
@@ -443,7 +443,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         # 3D [E, 2N, K] tensors under the id-less fused name 'experts.gate_up_proj'
         # (chunk(2, dim=-2) then loaded_weight[expert_id]). Per-expert patches
         # (confirmed on the 4+2 cluster, raysubmit_UMB8tQQKKLLLW1Qf: name
-        # '...experts.gate_up_proj' shape (1024, 2048) = [N, K], N=1024/K=2048)
+        # '...experts.gate_up_proj' shape (1024, 2048) = [2N, K], N=512/K=2048)
         # are mis-sliced into 1D rows there -> copy_non_nan_ dest (512, 2048) !=
         # src (2048,). apply_expert_patch_direct writes them into the
         # checkpoint-layout live parameters, bypassing the fused loader.
