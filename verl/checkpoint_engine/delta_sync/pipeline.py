@@ -620,10 +620,24 @@ class DeltaSyncMixin:
         changed_elems = 0
         total_elems = 0
         wire_bytes = 0
+        # [TIMING-TX 2026-10-10] Cost-center split for the steady send, after
+        # round 5 on the 4+2 cluster (raysubmit_vm8W34zfzVDfh3aK) showed the
+        # whole send flat at 85-111s regardless of the 1-1.5% changed ratio:
+        # export = the backend generator's per-param diff + probe work (runs
+        # lazily inside next(), including the per-param nonzero device syncs);
+        # gather = the batched rank-0 collectives; publish = zmq manifest +
+        # transport broadcast enqueue (the HCCL engine's per-flush synchronize
+        # is inside _broadcast_flush and separately logged there).
+        t_export = 0.0
+        t_gather = 0.0
+        t_publish = 0.0
+        n_entries = 0
 
         def _publish_steady(flush, is_last: bool) -> None:
-            nonlocal n_flushes
+            nonlocal n_flushes, t_publish
+            _tp = time.monotonic()
             self._publish_flush(flush, first=False, is_last=is_last)
+            t_publish += time.monotonic() - _tp
             n_flushes += 1
 
         bkt = _FlushBucket(self.bucket_size, self._assemble_flush, _publish_steady)
@@ -651,10 +665,26 @@ class DeltaSyncMixin:
         # ``weights`` is the BACKEND's HF delta stream (hf_delta_export): entries
         # already carry final HF coordinates -- naming, conversion, diff and
         # snapshot all happened on the backend side. This engine only batches,
-        # gathers and ships.
-        for slots, dtype_str, counts, hf_idx, hf_val, pg in weights:
+        # gathers and ships. The next()/put() split keeps the backend's lazy
+        # per-param work (diff, probe, nonzero) in t_export and the batching +
+        # collectives in t_gather (see [TIMING-TX] above).
+        _entries = iter(weights)
+        while True:
+            _te = time.monotonic()
+            try:
+                entry = next(_entries)
+            except StopIteration:
+                t_export += time.monotonic() - _te
+                break
+            t_export += time.monotonic() - _te
+            _tg = time.monotonic()
+            slots, dtype_str, counts, hf_idx, hf_val, pg = entry
             gq.put(pg, slots, dtype_str, counts, hf_idx, hf_val)
+            t_gather += time.monotonic() - _tg
+            n_entries += 1
+        _tg = time.monotonic()
         gq.flush_all()
+        t_gather += time.monotonic() - _tg
 
         # For SGLang, verify_every=K appends a dense state-verification sweep to
         # every K-th steady sync inside the same receive stream. The steady bucket
@@ -678,12 +708,17 @@ class DeltaSyncMixin:
         elapsed = time.time() - t0
         ratio = (changed_elems / total_elems) if total_elems else 0.0
         logger.info(
-            "delta-sharded send v=%s done in %.1fs (delta flushes=%d changed_ratio=%.4f wire=%.1fMB)",
+            "delta-sharded send v=%s done in %.1fs (delta flushes=%d changed_ratio=%.4f wire=%.1fMB) "
+            "[TIMING-TX export=%.1fs gather=%.1fs publish=%.1fs entries=%d]",
             global_steps,
             elapsed,
             n_flushes,
             ratio,
             wire_bytes / (1 << 20),
+            t_export,
+            t_gather,
+            t_publish,
+            n_entries,
         )
         if not total_elems or not changed_elems:
             return None

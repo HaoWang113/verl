@@ -286,6 +286,23 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
+        # [TIMING-SERVER 2026-10-10] Entry stamp for the weight-update lifecycle
+        # RPCs: the delta between the adapter's dispatch (see [TIMING-ADAPTER])
+        # and this entry is the server actor mailbox/queue lag -- round 5
+        # (raysubmit_vm8W34zfzVDfh3aK) showed ~5min between the trainer's send
+        # completion and the worker pumps starting, with the engines idle.
+        _method_name = method if isinstance(method, str) else getattr(method, "__name__", repr(method))
+        if isinstance(_method_name, str) and "verl_delta" in _method_name:
+            logger.warning("[TIMING-SERVER] collective_rpc %s enter", _method_name)
+            _t_srv = time.monotonic()
+            await self.engine.collective_rpc(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+            )
+            logger.warning("[TIMING-SERVER] collective_rpc %s done in %.1fs", _method_name, time.monotonic() - _t_srv)
+            return
         await self.engine.collective_rpc(
             method=method,
             timeout=timeout,

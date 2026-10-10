@@ -376,6 +376,12 @@ class ServerAdapter(BaseRollout):
         broadcasts themselves; the update RPC returns only after the session's
         last flush is applied, so no further synchronization is needed here.
         """
+        # [TIMING-ADAPTER 2026-10-10] Round 5 (raysubmit_vm8W34zfzVDfh3aK) showed
+        # the worker pumps entering their sessions ~5min after the trainer's send
+        # finished; these stamps bracket each lifecycle RPC so round 6 can tell
+        # dispatch lag (server actor mailbox) from pump-internal time (compare
+        # against the pump "session START" / "APPLIED bcast/apply" lines).
+        _t_init = time.monotonic()
         if not self._delta_weight_transfer_engine_initialized:
             await self._execute_method(
                 "verl_delta_init_weight_transfer_engine",
@@ -391,8 +397,11 @@ class ServerAdapter(BaseRollout):
                 },
             )
             self._delta_weight_transfer_engine_initialized = True
+        _t_init_s = time.monotonic() - _t_init
 
+        _t_start = time.monotonic()
         await self._execute_method("verl_delta_start_weight_update")
+        _t_start_s = time.monotonic() - _t_start
 
         update_infos = _hccl_group_update_infos(
             self.replica_rank,
@@ -401,9 +410,22 @@ class ServerAdapter(BaseRollout):
             self.config.pipeline_model_parallel_size,
         )
         _assert_hccl_group_geometry(update_infos, self.replica_rank, int(rendezvous["world_size"]))
+        _t_update = time.monotonic()
         await self._execute_method("update_verl_delta_weights", kwargs={"update_info": update_infos})
+        _t_update_s = time.monotonic() - _t_update
 
+        _t_finish = time.monotonic()
         await self._execute_method("verl_delta_finish_weight_update")
+        _t_finish_s = time.monotonic() - _t_finish
+        logger.warning(
+            "[TIMING-ADAPTER] replica=%s v=%s init=%.1fs start=%.1fs update=%.1fs finish=%.1fs",
+            self.replica_rank,
+            global_steps,
+            _t_init_s,
+            _t_start_s,
+            _t_update_s,
+            _t_finish_s,
+        )
 
         # The rendezvous stream carries no further items; drain to close it.
         async for _ in flushes:

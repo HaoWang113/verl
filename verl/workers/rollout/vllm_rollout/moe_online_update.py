@@ -486,7 +486,38 @@ def parse_expert_patch_name(name: str):
     return m.group("layer"), int(m.group("eid")), m.group("proj")
 
 
-def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, values, indices) -> bool:
+def build_expert_module_index(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
+    """One-walk qualname index of the fused-expert modules for per-patch lookup.
+
+    Keys are every fused-expert module's qualname plus each of its ancestor
+    prefixes, so the per-patch lookup condition ``qualname == candidate or
+    qualname.startswith(candidate + '.')`` becomes an O(1) dict hit;
+    first-module-wins matches the named_modules() scan order (setdefault
+    registers in walk order). Round 5 re-ran the full module-tree walk for
+    EVERY per-expert patch -- 16k+ patches per flush x ~1-2k modules of Python
+    string matching dominated the receiver-side apply (45-48s per flush,
+    raysubmit_vm8W34zfzVDfh3aK). Build per flush, not per process: the walk
+    costs milliseconds, and rebuilding keeps the index immune to cross-session
+    module rebinding (sleep-mode wake-up paths).
+    """
+    index: dict[str, torch.nn.Module] = {}
+    for qualname, module in model.named_modules():
+        if getattr(module, "w13_weight", None) is not None or getattr(module, "w13_weight_list", None) is not None:
+            parts = qualname.split(".")
+            for i in range(len(parts)):
+                index.setdefault(".".join(parts[: i + 1]), module)
+    return index
+
+
+def apply_expert_patch_direct(
+    model: torch.nn.Module,
+    name: str,
+    shape,
+    dtype,
+    values,
+    indices,
+    module_index: dict | None = None,
+) -> bool:
     """Apply one sparse per-expert patch directly into the checkpoint-layout live
     parameter, bypassing ``model.load_weights``. Returns ``True`` if the patch
     was applied here (or intentionally skipped on this rank), ``False`` if the
@@ -495,6 +526,12 @@ def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, v
     per-expert parameters the loader applies). Raises on a fused-expert model
     when no module matches the (remapped) layer prefix -- the loader would
     silently skip the patch there.
+
+    ``module_index`` (from :func:`build_expert_module_index`, built once per
+    flush by the caller) replaces the per-patch full ``named_modules()`` walk
+    with O(1) dict lookups; ``None`` keeps the legacy walk (tests, direct
+    callers). Both paths are equivalent: the index keys cover exactly the
+    walk's ``qualname == cand or qualname.startswith(cand + '.')`` condition.
 
     The sparse window guarantees the live parameters sit at checkpoint layout
     at apply time: ``w13_weight`` = [E, 2N, K], ``w2_weight`` = [E, K, N]
@@ -523,13 +560,21 @@ def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, v
     # no other apply path.
     candidates = list(_layer_prefix_candidates(layer_prefix))
     target_module = None
-    for mod_qualname, module in model.named_modules():
-        if any(
-            mod_qualname == cand or mod_qualname.startswith(cand + ".") for cand in candidates
-        ):
-            if getattr(module, "w13_weight", None) is not None or getattr(module, "w13_weight_list", None) is not None:
-                target_module = module
+    if module_index is not None:
+        for cand in candidates:
+            target_module = module_index.get(cand)
+            if target_module is not None:
                 break
+    else:
+        for mod_qualname, module in model.named_modules():
+            if any(mod_qualname == cand or mod_qualname.startswith(cand + ".") for cand in candidates):
+                has_expert_weights = (
+                    getattr(module, "w13_weight", None) is not None
+                    or getattr(module, "w13_weight_list", None) is not None
+                )
+                if has_expert_weights:
+                    target_module = module
+                    break
     if target_module is None:
         # A model with NO fused-expert modules holds per-expert weights as
         # ordinary parameters, so the model loader is the legitimate apply

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -28,6 +30,8 @@ from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -352,11 +356,25 @@ class CheckpointEngineWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
+        # [TIMING-CE 2026-10-10] Round 5 (raysubmit_vm8W34zfzVDfh3aK) showed the
+        # rollout-side pumps starting ~5min after the trainer finished its send,
+        # while this fire-and-forget worker (blocking=False) is the only bridge
+        # between the two. Timestamp the entry and the adapter await so round 6
+        # can tell Ray-actor scheduling lag from server-RPC mailbox lag: compare
+        # the entry stamp against the trainer's "delta-sharded send ... done"
+        # line, and the adapter duration against the worker pumps'
+        # "session START/END" lines.
+        _t_ce = time.monotonic()
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
         await self.server_adapter.update_weights(
             weights,
             global_steps=global_steps,
             wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
+        )
+        logger.warning(
+            "[TIMING-CE] rollout-side update_weights v=%s total=%.1fs (receive+adapter)",
+            global_steps,
+            time.monotonic() - _t_ce,
         )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
@@ -515,7 +533,9 @@ class CheckpointEngineManager:
             return {}
 
         # 1. abort and save all unfinished requests for partial rollout
+        _t0 = time.monotonic()
         await self.abort_replicas()
+        _t_abort = time.monotonic() - _t0
 
         # 2. create a temporay worker group for all replicas
         workers = []
@@ -525,16 +545,28 @@ class CheckpointEngineManager:
         actor_wg = self.actor_wg
 
         # 3. release kv_cache before weight sync (weights stay in place)
+        _t0 = time.monotonic()
         await self.release_kv_cache_replicas()
+        _t_release_kv = time.monotonic() - _t0
 
         # 4. build process group
+        _t0 = time.monotonic()
         self.build_process_group(rollout)
+        _t_build_pg = time.monotonic() - _t0
 
         # 5. update weights of all workers
+        # [TIMING-MGR 2026-10-10] The rollout-side update_weights is registered
+        # blocking=False (fire-and-forget actors), so this ray.get nominally
+        # returns after the actor tasks COMPLETE -- round 5's param_sync (113s)
+        # finishing long before the pumps ran (12:32+ vs send done 12:27) says
+        # otherwise on the delta path; these phase stamps pin which leg carries
+        # the trainer-visible cost versus the engine-side lag.
+        _t0 = time.monotonic()
         results = ray.get(
             actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
             + rollout.update_weights(global_steps=global_steps)
         )
+        _t_ray_get = time.monotonic() - _t0
         # The sender workers return the engine's per-sync metrics (empty for
         # backends that don't track any); merge and hand them to the trainer.
         sync_metrics: dict = {}
@@ -543,16 +575,35 @@ class CheckpointEngineManager:
                 sync_metrics.update(result)
 
         # 6. finalize all workers
+        _t0 = time.monotonic()
         ray.get(
             actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
+        _t_finalize = time.monotonic() - _t0
 
         # 7. restore kv_cache after weight sync
+        _t0 = time.monotonic()
         await self.resume_kv_cache_replicas()
+        _t_resume_kv = time.monotonic() - _t0
 
         # 8. resume all unfinished requests for partial rollout
+        _t0 = time.monotonic()
         await self.resume_generation_replicas()
+        _t_resume_gen = time.monotonic() - _t0
+
+        logger.warning(
+            "[TIMING-MGR] update_weights v=%s abort=%.1fs release_kv=%.1fs build_pg=%.1fs "
+            "ray_get=%.1fs finalize=%.1fs resume_kv=%.1fs resume_gen=%.1fs",
+            global_steps,
+            _t_abort,
+            _t_release_kv,
+            _t_build_pg,
+            _t_ray_get,
+            _t_finalize,
+            _t_resume_kv,
+            _t_resume_gen,
+        )
 
         return sync_metrics
 

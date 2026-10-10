@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -383,7 +384,15 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
 
     def _decode_and_apply(self, payload: list[tuple[str, torch.Tensor]]) -> None:
         """Decode one flush's named tensors into checkpoint patches and apply them."""
+        # [TIMING-RX 2026-10-10] Cost-center split for the receiver-side apply,
+        # after round 5 on the 4+2 cluster (raysubmit_vm8W34zfzVDfh3aK) showed
+        # 45-48s per flush against a 0.2s broadcast: decode (wire validation +
+        # checksum), index (one module-tree walk for the per-patch lookup
+        # table), direct (the per-expert direct-write loop) and loader (the
+        # vLLM patch loader fallback for non-expert names).
+        _t_rx = time.monotonic()
         encoding, patches = decode_delta_payload(payload)
+        _t_decode = time.monotonic() - _t_rx
 
         # [DIAG-DELTA 2026-10-08] Sparse delta path (v>=1) -- dump the decoded
         # patches' name/shape/values.numel/indices.numel BEFORE
@@ -448,18 +457,33 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         # src (2048,). apply_expert_patch_direct writes them into the
         # checkpoint-layout live parameters, bypassing the fused loader.
         # Non-expert patches go through the normal loader path.
-        from verl.workers.rollout.vllm_rollout.moe_online_update import apply_expert_patch_direct
+        from verl.workers.rollout.vllm_rollout.moe_online_update import (
+            apply_expert_patch_direct,
+            build_expert_module_index,
+        )
+
+        _t_ix = time.monotonic()
+        module_index = build_expert_module_index(self.model)
+        _t_index = time.monotonic() - _t_ix
 
         remaining_patches = []
         n_expert_applied = 0
+        _t_direct = time.monotonic()
         for patch in patches:
             applied = apply_expert_patch_direct(
-                self.model, patch.name, patch.shape, patch.dtype, patch.values, patch.indices
+                self.model,
+                patch.name,
+                patch.shape,
+                patch.dtype,
+                patch.values,
+                patch.indices,
+                module_index=module_index,
             )
             if applied:
                 n_expert_applied += 1
             else:
                 remaining_patches.append(patch)
+        _t_direct_s = time.monotonic() - _t_direct
         if n_expert_applied:
             logger.warning(
                 "delta: applied %d per-expert patches via direct-write, %d via load_checkpoint_weight_patches",
@@ -507,11 +531,25 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         if remaining_patches:
             # The trusted producer emits every changed position at most once;
             # skip vLLM's sort-based duplicate check on the rollout GPU.
+            _t_loader = time.monotonic()
             load_checkpoint_weight_patches(
                 self.model,
                 remaining_patches,
                 validate_unique_indices=False,
             )
+            _t_loader_s = time.monotonic() - _t_loader
+        else:
+            _t_loader_s = 0.0
+        logger.warning(
+            "[TIMING-RX] n_patches=%d decode=%.2fs index=%.3fs direct=%.1fs loader=%.1fs (expert=%d loader=%d)",
+            len(patches),
+            _t_decode,
+            _t_index,
+            _t_direct_s,
+            _t_loader_s,
+            n_expert_applied,
+            len(remaining_patches),
+        )
 
     def _assert_dense_session_supported(self) -> None:
         """Dense flushes lean on vLLM's layerwise reload, which copies reloaded

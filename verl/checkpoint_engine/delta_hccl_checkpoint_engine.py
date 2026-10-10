@@ -335,8 +335,8 @@ class DeltaHCCLCheckpointEngine(DeltaSyncMixin, HCCLCheckpointEngine):
         logger.warning(
             "delta-hccl sender flush=%d pos=%d val=%d bytes wire done in %.1fs%s",
             self._flush_seq,
-            0 if pos_u8 is None else pos_u8.numel,
-            val_u8.numel,
+            0 if pos_u8 is None else pos_u8.numel(),
+            val_u8.numel(),
             elapsed,
             " (SLOW)" if elapsed > SLOW_FLUSH_SECONDS else "",
         )
