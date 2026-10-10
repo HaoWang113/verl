@@ -372,9 +372,10 @@ class CheckpointEngineWorker(Worker):
             wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
         )
         logger.warning(
-            "[TIMING-CE] rollout-side update_weights v=%s total=%.1fs (receive+adapter)",
+            "[TIMING-CE] rollout-side update_weights v=%s total=%.1fs wall=%.3f (receive+adapter)",
             global_steps,
             time.monotonic() - _t_ce,
+            time.time(),
         )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
@@ -436,6 +437,22 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        # [Round 7] Steady-round process-group cache (see update_weights): the
+        # rollout worker-set identity the group was last built for.
+        self._pg_workers: tuple | None = None
+
+    def _pg_cache_valid(self, rollout_workers: list) -> bool:
+        """[Round 7] True when the process group can be reused for this worker
+        set: the delta_sharded engines keep their zmq rendezvous and PyHccl
+        communicator across rounds (rebuild_group is refused at engine init) and
+        init_process_group only records idempotent rendezvous state, so the
+        per-round prepare/init ray.get round-trips are pure overhead. Replica
+        add/remove changes the worker set and rebuilds; other backends always
+        rebuild as before."""
+        if self.backend != "delta_sharded" or self._pg_workers is None:
+            return False
+        current = tuple(getattr(h, "_actor_id", None) for h in rollout_workers)
+        return current == self._pg_workers and all(a is not None for a in current)
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -550,8 +567,14 @@ class CheckpointEngineManager:
         _t_release_kv = time.monotonic() - _t0
 
         # 4. build process group
+        # [Round 7] skip on steady delta_sharded rounds (see _pg_cache_valid):
+        # round 6 measured the per-round prepare/init ray.get round-trips as a
+        # fixed multi-second cost of every sync.
         _t0 = time.monotonic()
-        self.build_process_group(rollout)
+        pg_cached = self._pg_cache_valid(workers)
+        if not pg_cached:
+            self.build_process_group(rollout)
+            self._pg_workers = tuple(getattr(h, "_actor_id", None) for h in workers)
         _t_build_pg = time.monotonic() - _t0
 
         # 5. update weights of all workers
@@ -592,18 +615,28 @@ class CheckpointEngineManager:
         await self.resume_generation_replicas()
         _t_resume_gen = time.monotonic() - _t0
 
-        logger.warning(
-            "[TIMING-MGR] update_weights v=%s abort=%.1fs release_kv=%.1fs build_pg=%.1fs "
-            "ray_get=%.1fs finalize=%.1fs resume_kv=%.1fs resume_gen=%.1fs",
-            global_steps,
-            _t_abort,
-            _t_release_kv,
-            _t_build_pg,
-            _t_ray_get,
-            _t_finalize,
-            _t_resume_kv,
-            _t_resume_gen,
+        _mgr_line = (
+            "[TIMING-MGR] update_weights v=%s abort=%.1fs release_kv=%.1fs build_pg=%.1fs(pg_cached=%d) "
+            "ray_get=%.1fs finalize=%.1fs resume_kv=%.1fs resume_gen=%.1fs wall=%.3f"
+            % (
+                global_steps,
+                _t_abort,
+                _t_release_kv,
+                _t_build_pg,
+                1 if pg_cached else 0,
+                _t_ray_get,
+                _t_finalize,
+                _t_resume_kv,
+                _t_resume_gen,
+                time.time(),
+            )
         )
+        # [Round 7] The driver process's logging config swallowed the logger call
+        # in round 6 (zero TIMING-MGR lines in ray job logs while the same
+        # process's print()/warnings passed through) -- mirror to stdout so the
+        # manager phase split is always collectable.
+        logger.warning(_mgr_line)
+        print(_mgr_line, flush=True)
 
         return sync_metrics
 

@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .encode import checksum
+from .encode import _SPEC_MAGIC, checksum, unpack_spec
 
 
 @dataclass
@@ -59,11 +59,19 @@ def decode_delta_wire(named_tensors: Iterable[tuple[str, torch.Tensor]]) -> tupl
     try:
         spec_tensor = tensors["__delta_spec__"]
         values = tensors["__values__"]
-        spec = json.loads(bytes(spec_tensor.detach().cpu().numpy().tobytes()).decode())
+        raw = bytes(spec_tensor.detach().cpu().numpy().tobytes())
     except KeyError as exc:
         raise ValueError(f"DeltaFlush is missing {exc.args[0]}") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("DeltaFlush contains an invalid JSON spec") from exc
+    # [Round 7] DSB1 binary spec (see encode.pack_spec) with JSON fallback for
+    # mixed-version producers; the json leg also keeps hand-built specs in
+    # tests working unchanged.
+    if raw[:4] == _SPEC_MAGIC:
+        spec = unpack_spec(raw)
+    else:
+        try:
+            spec = json.loads(raw.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("DeltaFlush contains an invalid JSON spec") from exc
 
     encoding = spec["encoding"]
     if encoding not in {"dense", "indices"}:

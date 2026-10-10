@@ -48,6 +48,7 @@ permutation. Fingerprint evidence:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from importlib import import_module
 from importlib.metadata import version as _package_version
@@ -693,3 +694,244 @@ def apply_expert_patch_direct(
 
         torch.where(torch.isnan(src), dest, src, out=dest)
     return True
+
+
+# ---- batched per-expert direct-apply (round 7) ------------------------------
+# The per-patch path above costs ~1.5ms of fixed launch/Python overhead per
+# patch (NaN densify full-slot fill + index_copy + to() + narrow + a full-slot
+# torch.where masked write): round 6 measured direct=17-23s per large flush at
+# 15398 patches, ~99% of it overhead (the touched elements are ~1% of a slot).
+# The batched path groups one flush's patches by (fused-expert module, proj),
+# concatenates each group's positions/values (views into the flush buffers),
+# remaps full-shape flat coordinates to live TP-narrowed checkpoint-layout
+# coordinates with vectorized index arithmetic, and writes each group with ONE
+# index_copy_ into w13/w2 -- same guards, same EP skip, same coordinates as the
+# per-patch path, ~25 vectorized ops per group (~80 groups per flush).
+
+
+def _patch_indices(patch) -> torch.Tensor | None:
+    """Indices accessor working for both patch shapes on the apply path
+    (CheckpointWeightPatch.indices from the vLLM patch API, DeltaPatch.positions
+    from the device-agnostic decode)."""
+    idx = getattr(patch, "indices", None)
+    if idx is not None:
+        return idx
+    return getattr(patch, "positions", None)
+
+
+def apply_expert_patches_batched(
+    model: torch.nn.Module,
+    patches,
+    module_index: dict | None = None,
+) -> tuple[int, int, list]:
+    """Apply all per-expert sparse patches of one flush with vectorized
+    coordinate remapping (see the module comment above).
+
+    Returns ``(n_applied, n_nonlocal, remaining)``: ``n_applied`` counts patches
+    written (or no-op'd as zero-position), ``n_nonlocal`` counts EP-skipped
+    patches (this rank does not own the expert), and ``remaining`` carries every
+    patch this function did not apply -- non-expert names, per-expert patches
+    without positions (dense), and (with no fused-expert modules on the model)
+    all per-expert names, which the model loader owns. Raises the same
+    fail-loud errors as :func:`apply_expert_patch_direct` for unmatched
+    prefixes and layout violations.
+    """
+    groups: dict[tuple[torch.nn.Module, str], list] = {}
+    remaining: list = []
+    for patch in patches:
+        idx = _patch_indices(patch)
+        parsed = parse_expert_patch_name(patch.name) if idx is not None else None
+        if parsed is None:
+            remaining.append(patch)
+            continue
+        layer_prefix, expert_id, proj = parsed
+        target_module = None
+        if module_index is not None:
+            for cand in _layer_prefix_candidates(layer_prefix):
+                target_module = module_index.get(cand)
+                if target_module is not None:
+                    break
+        else:
+            candidates = list(_layer_prefix_candidates(layer_prefix))
+            for mod_qualname, module in model.named_modules():
+                if any(mod_qualname == cand or mod_qualname.startswith(cand + ".") for cand in candidates):
+                    if (
+                        getattr(module, "w13_weight", None) is not None
+                        or getattr(module, "w13_weight_list", None) is not None
+                    ):
+                        target_module = module
+                        break
+        if target_module is None:
+            # No fused-expert modules anywhere: per-expert weights are ordinary
+            # parameters and the model loader is the legitimate apply path (same
+            # contract as the per-patch function). On a fused-expert model an
+            # unmatched prefix fails loud below instead.
+            if next(iter_expert_weight_modules(model), None) is None:
+                remaining.append(patch)
+                continue
+            raise NotImplementedError(
+                f"apply_expert_patches_batched({patch.name!r}): no fused-expert module matches the layer prefix "
+                f"({list(_layer_prefix_candidates(layer_prefix))}) although the model carries fused-expert modules. "
+                "Per-expert patches cannot fall back to the model loader on a fused-expert model."
+            )
+        groups.setdefault((target_module, proj), []).append((patch, expert_id, idx))
+
+    n_applied = 0
+    n_nonlocal = 0
+    total_kept = 0
+    total_tp_dropped = 0
+    t0 = time.monotonic()
+    for (module, proj), members in groups.items():
+        w13 = getattr(module, "w13_weight", None)
+        w2 = getattr(module, "w2_weight", None)
+        if not isinstance(w13, torch.nn.Parameter) or not isinstance(w2, torch.nn.Parameter):
+            raise NotImplementedError(
+                f"apply_expert_patches_batched: matched fused-expert module {type(module).__name__} exposes no "
+                "Parameter-typed w13_weight/w2_weight (per-expert weight-list variant?); the model loader cannot "
+                "apply per-expert names on a fused-expert model."
+            )
+        is_w13 = proj in ("gate_proj", "up_proj", "gate_up_proj")
+        param = w13 if is_w13 else w2
+        hidden = _module_hidden_size(module)
+
+        # EP: map global expert ids to local; drop the ones this rank does not own.
+        emm = getattr(module, "expert_map_manager", None)
+        local_members = []
+        for patch, eid, idx in members:
+            if emm is not None:
+                lid = emm.map_global_to_local(eid)
+                if lid == -1:
+                    n_nonlocal += 1
+                    continue
+                eid = lid
+            local_members.append((patch, eid, idx))
+        if not local_members:
+            continue
+        eids = [eid for _, eid, _ in local_members]
+        if min(eids) < 0 or max(eids) >= param.shape[0]:
+            raise NotImplementedError(
+                f"apply_expert_patches_batched({module!r}): expert ids {min(eids)}..{max(eids)} out of range for "
+                f"the local expert stack ({param.shape[0]} experts); expert_map_manager is "
+                f"{'absent' if emm is None else 'inconsistent with the live parameter'}."
+            )
+
+        # Uniform slot geometry within one (module, proj) group (the wire emits
+        # per-expert 2D checkpoint shapes; anything else is a contract change).
+        shape0 = tuple(int(x) for x in local_members[0][0].shape)
+        for patch, _, _ in local_members[1:]:
+            if tuple(int(x) for x in patch.shape) != shape0:
+                raise NotImplementedError(
+                    "apply_expert_patches_batched: mixed patch shapes within one (module, proj) group "
+                    f"({shape0} vs {tuple(patch.shape)} for {patch.name!r}); batched apply requires uniform "
+                    "slot geometry."
+                )
+        if len(shape0) != 2:
+            raise NotImplementedError(
+                f"apply_expert_patches_batched({local_members[0][0].name!r}): expected a 2D per-expert patch, "
+                f"got shape {shape0}."
+            )
+
+        # Layout guard on the param being written (the window guarantees
+        # checkpoint layout at apply time; refuse transposed coordinates).
+        if is_w13 and param.shape[2] != hidden:
+            raise NotImplementedError(
+                f"apply_expert_patches_batched: live w13 {tuple(param.shape)} is not at checkpoint layout "
+                f"[E, 2N, K] (dim-2 should be hidden_size={hidden}); refusing to write transposed coordinates."
+            )
+        if not is_w13 and param.shape[1] != hidden:
+            raise NotImplementedError(
+                f"apply_expert_patches_batched: live w2 {tuple(param.shape)} is not at checkpoint layout "
+                f"[E, K, N] (dim-1 should be hidden_size={hidden}); refusing to write transposed coordinates."
+            )
+        tp_rank = getattr(module, "tp_rank", None)
+        if not isinstance(tp_rank, int):
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            tp_rank = get_tensor_model_parallel_rank()
+
+        # Concatenate the group's positions/values (views into the flush
+        # buffers) and expand per-patch metadata to per-position.
+        pos = torch.cat([idx for _, _, idx in local_members]).to(torch.int64)
+        val = torch.cat([patch.values for patch, _, _ in local_members])
+        eid_pp = torch.tensor(eids, dtype=torch.int64, device=pos.device).repeat_interleave(
+            torch.tensor([idx.numel() for _, _, idx in local_members], dtype=torch.int64, device=pos.device)
+        )
+
+        # Flat position -> (row, col) in the patch's full-shape slot. The
+        # divisor is always shape0[1]: [rows, K] for w13 slots, [K, N] for w2.
+        div = int(shape0[1])
+        row = pos // div
+        col = pos - row * div
+        keep = torch.ones_like(row, dtype=torch.bool)
+        if is_w13:
+            n_full = int(shape0[0])
+            k_local = int(param.shape[2])
+            n_local = int(param.shape[1]) // 2
+            if proj == "gate_up_proj":
+                if n_full % 2:
+                    raise NotImplementedError(
+                        f"apply_expert_patches_batched: gate_up_proj patch rows ({n_full}) not even."
+                    )
+                n_full //= 2
+                is_up = row >= n_full
+                row = torch.where(is_up, row - n_full, row)
+                # per-position row-section offset: gate rows land at [0, N_local),
+                # up rows at [N_local, 2N_local) of the live checkpoint slot
+                sec = torch.where(is_up, torch.full_like(row, n_local), torch.zeros_like(row))
+            else:
+                sec = torch.full_like(row, n_local if proj == "up_proj" else 0)
+            if n_full % n_local or div % k_local:
+                raise NotImplementedError(
+                    f"apply_expert_patches_batched({proj}): full slot ({n_full}, {div}) not divisible by the "
+                    f"TP-narrowed live slot ({n_local}, {k_local})."
+                )
+            if n_full > n_local:  # rows TP-sharded: keep this rank's slice
+                row = row - tp_rank * n_local
+                keep &= (row >= 0) & (row < n_local)
+            if div > k_local:  # K dim TP-sharded
+                col = col - tp_rank * k_local
+                keep &= (col >= 0) & (col < k_local)
+            dest = (sec + row) * k_local + col
+            slot_numel = int(param.shape[1]) * k_local
+        else:  # down_proj [K_full, N_full] -> w2 [E, K_local, N_local]
+            k_full = int(shape0[0])
+            n_full = int(shape0[1])
+            k_local = int(param.shape[1])
+            n_local = int(param.shape[2])
+            if k_full % k_local or n_full % n_local:
+                raise NotImplementedError(
+                    f"apply_expert_patches_batched(down_proj): full slot ({k_full}, {n_full}) not divisible by "
+                    f"the TP-narrowed live slot ({k_local}, {n_local})."
+                )
+            if k_full > k_local:
+                row = row - tp_rank * k_local
+                keep &= (row >= 0) & (row < k_local)
+            if n_full > n_local:
+                col = col - tp_rank * n_local
+                keep &= (col >= 0) & (col < n_local)
+            dest = row * n_local + col
+            slot_numel = k_local * n_local
+        dest = dest + eid_pp * slot_numel
+
+        flat = param.data.reshape(-2)
+        if bool(keep.all()):
+            flat.index_copy_(0, dest, val.to(flat.dtype))
+            total_kept += int(dest.numel())
+        else:
+            kept = int(keep.sum())
+            flat.index_copy_(0, dest[keep], val[keep].to(flat.dtype))
+            total_kept += kept
+            total_tp_dropped += int(dest.numel()) - kept
+        n_applied += len(local_members)
+    if groups:
+        logger.warning(
+            "[APPLY-GROUPS] batched direct-write: groups=%d patches=%d positions_kept=%d tp_dropped=%d "
+            "nonlocal=%d elapsed=%.2fs",
+            len(groups),
+            n_applied,
+            total_kept,
+            total_tp_dropped,
+            n_nonlocal,
+            time.monotonic() - t0,
+        )
+    return n_applied, n_nonlocal, remaining

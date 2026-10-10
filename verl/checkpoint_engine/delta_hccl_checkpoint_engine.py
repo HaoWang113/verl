@@ -331,14 +331,17 @@ class DeltaHCCLCheckpointEngine(DeltaSyncMixin, HCCLCheckpointEngine):
         elapsed = time.monotonic() - t0
         # The synchronize only returns once every group member entered this
         # flush's collectives, so this one line timestamps the slowest rank:
-        # a jump here names the flush where a peer stalled.
+        # a jump here names the flush where a peer stalled. [Round 7] wall=
+        # pairs with the receivers' TIMING-EPOCH/manifest stamps for direct
+        # node clock-skew measurement (round 6: up to ~13.8 min across nodes).
         logger.warning(
-            "delta-hccl sender flush=%d pos=%d val=%d bytes wire done in %.1fs%s",
+            "delta-hccl sender flush=%d pos=%d val=%d bytes wire done in %.1fs%s wall=%.3f",
             self._flush_seq,
             0 if pos_u8 is None else pos_u8.numel(),
             val_u8.numel(),
             elapsed,
             " (SLOW)" if elapsed > SLOW_FLUSH_SECONDS else "",
+            time.time(),
         )
 
     def _release_after_round(self, phase: str) -> None:

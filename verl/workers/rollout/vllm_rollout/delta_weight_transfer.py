@@ -21,6 +21,7 @@ checkpoint names, packed weights, and TP slicing.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from collections.abc import Iterable, Iterator
@@ -459,6 +460,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         # Non-expert patches go through the normal loader path.
         from verl.workers.rollout.vllm_rollout.moe_online_update import (
             apply_expert_patch_direct,
+            apply_expert_patches_batched,
             build_expert_module_index,
         )
 
@@ -469,20 +471,36 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         remaining_patches = []
         n_expert_applied = 0
         _t_direct = time.monotonic()
-        for patch in patches:
-            applied = apply_expert_patch_direct(
-                self.model,
-                patch.name,
-                patch.shape,
-                patch.dtype,
-                patch.values,
-                patch.indices,
-                module_index=module_index,
+        # [Round 7] Batched direct-write first (vectorized per-group remap; the
+        # per-patch loop cost ~1.5ms x 15k patches = 17-23s per large flush in
+        # round 6). VERL_DELTA_BATCHED_APPLY=0 selects the legacy per-patch loop
+        # as a one-line isolation switch for the test machine; patches the
+        # batched pass declines (non-expert names, dense per-expert patches)
+        # always take the per-patch/loader routes below.
+        if os.getenv("VERL_DELTA_BATCHED_APPLY", "1") == "1":
+            n_expert_applied, _n_nonlocal, remaining_patches = apply_expert_patches_batched(
+                self.model, patches, module_index=module_index
             )
-            if applied:
-                n_expert_applied += 1
-            else:
-                remaining_patches.append(patch)
+        else:
+            # isolation switch off: every patch takes the legacy per-patch loop
+            remaining_patches = list(patches)
+        if remaining_patches:
+            still_remaining = []
+            for patch in remaining_patches:
+                applied = apply_expert_patch_direct(
+                    self.model,
+                    patch.name,
+                    patch.shape,
+                    patch.dtype,
+                    patch.values,
+                    patch.indices,
+                    module_index=module_index,
+                )
+                if applied:
+                    n_expert_applied += 1
+                else:
+                    still_remaining.append(patch)
+            remaining_patches = still_remaining
         _t_direct_s = time.monotonic() - _t_direct
         if n_expert_applied:
             logger.warning(
@@ -541,7 +559,8 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         else:
             _t_loader_s = 0.0
         logger.warning(
-            "[TIMING-RX] n_patches=%d decode=%.2fs index=%.3fs direct=%.1fs loader=%.1fs (expert=%d loader=%d)",
+            "[TIMING-RX] n_patches=%d decode=%.2fs index=%.3fs direct=%.1fs loader=%.1fs "
+            "(expert=%d loader=%d) wall=%.3f",
             len(patches),
             _t_decode,
             _t_index,
@@ -549,6 +568,7 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
             _t_loader_s,
             n_expert_applied,
             len(remaining_patches),
+            time.time(),
         )
 
     def _assert_dense_session_supported(self) -> None:
@@ -779,6 +799,13 @@ class VerlDeltaHCCLWeightTransferEngine(VerlDeltaIPCWeightTransferEngine):
         from verl.checkpoint_engine.delta_sync.hccl_receiver import pump_hccl_delta_session
 
         assert self._rendezvous is not None, "init_weight_transfer_engine must run first"
+        # [TIMING-EPOCH 2026-10-10] Wall-clock echo at the same events the
+        # sender stamps (flush publish / send done): round 6 discovered up to
+        # ~13.8 minutes of node clock skew masquerading as a "5-minute engine
+        # idle" and a "72s pump stagger" that never existed. Pairing these
+        # stamps with the sender's `wall=` fields exposes any residual skew
+        # directly, without reconstructing it from collective completion times.
+        logger.warning("[TIMING-EPOCH] delta-hccl pump enter rank=%s wall=%.3f", update_info.group_rank, time.time())
         try:
             sub, comm = self._ensure_channel(update_info.group_rank)
             pump_hccl_delta_session(
@@ -820,15 +847,24 @@ class VerlDeltaHCCLWeightTransferEngine(VerlDeltaIPCWeightTransferEngine):
     def _on_sparse_session_begin(self) -> None:
         from verl.workers.rollout.vllm_rollout.moe_online_update import open_expert_layout_window
 
+        # [TIMING-WIN 2026-10-10] Layout-window open/close are delta-specific
+        # costs (checkpoint-layout flips + the close-time runtime restore
+        # transposes, ~full expert weights per worker) -- the T3 term of the
+        # sync-cost decomposition. Note: open runs inside the first flush's
+        # apply, so it also inflates that flush's apply_total.
+        _t_win = time.monotonic()
         self._expert_layout_window = open_expert_layout_window(self.model)
+        logger.warning("[TIMING-WIN] expert layout window open=%.1fs", time.monotonic() - _t_win)
 
     def _on_sparse_session_end(self) -> None:
         if self._expert_layout_window is None:
             return
         from verl.workers.rollout.vllm_rollout.moe_online_update import close_expert_layout_window
 
+        _t_win = time.monotonic()
         close_expert_layout_window(self._expert_layout_window)
         self._expert_layout_window = None
+        logger.warning("[TIMING-WIN] expert layout window close=%.1fs", time.monotonic() - _t_win)
 
     def shutdown(self) -> None:
         super().shutdown()

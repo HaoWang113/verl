@@ -235,7 +235,8 @@ class DeltaSyncMixin:
     # is transparent); 64M elements bounds the transient to ~512 MiB.
     MAX_ENTRY_ELEMS = 64 << 20
 
-    def __init__(self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0, **kwargs):
+    def __init__(self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0,
+                 steady_flush_megabytes: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         assert encoding == "indices", f"delta_sharded ships only the 'indices' position encoding; got {encoding!r}"
         self.encoding = encoding
@@ -246,6 +247,20 @@ class DeltaSyncMixin:
         # (one count-matrix all_gather + two padded gathers per group instead of
         # three collectives per parameter).
         self.batch_gather = int(batch_gather)
+        # [Round 7] Steady flush cap in MB. The transport's bucket_size is sized
+        # for the full-model seed streams (GB-class); at a 1-1.5% changed ratio
+        # the steady payload is a few GB of *delta*, and a 2GB cap degenerates to
+        # "one giant flush published only after the whole export+gather" (round 6:
+        # flush=1 fired at t=67s of a 98s send with receivers idle throughout).
+        # A 512MB cap streams ~5 flushes, so the first hits the wire ~20% into
+        # the export and receiver apply overlaps the sender's ongoing gather.
+        # None defaults to min(bucket_size, 512MB).
+        self.steady_flush_megabytes = None if steady_flush_megabytes is None else int(steady_flush_megabytes)
+
+    def _steady_flush_cap(self) -> int:
+        if self.steady_flush_megabytes is not None:
+            return self.steady_flush_megabytes << 20
+        return min(int(getattr(self, "bucket_size", 512 << 20)), 512 << 20)
 
     # ---- transport hooks (implemented by the concrete engine) ----
 
@@ -295,7 +310,14 @@ class DeltaSyncMixin:
         self.socket.send_string(self.topic, flags=zmq.SNDMORE)
         self.socket.send_pyobj(meta)
         pos_u8 = flush.positions_cpu.to(self._wire_device, non_blocking=True).contiguous().view(torch.uint8)
-        val_u8 = flush.values_gpu.contiguous().view(torch.uint8)
+        # [Round 7] The steady assemble runs on host (batched export + host
+        # gather return), so the values buffer may need the same one-hop move
+        # to the wire device (no-op when already resident, e.g. the seed
+        # streams and device-resident legacy paths).
+        val_src = flush.values_gpu
+        if val_src.device != self._wire_device:
+            val_src = val_src.to(self._wire_device, non_blocking=True)
+        val_u8 = val_src.contiguous().view(torch.uint8)
         self._broadcast_flush(pos_u8, val_u8)
 
     def _publish_values_flush(
@@ -640,7 +662,10 @@ class DeltaSyncMixin:
             t_publish += time.monotonic() - _tp
             n_flushes += 1
 
-        bkt = _FlushBucket(self.bucket_size, self._assemble_flush, _publish_steady)
+        # [Round 7] steady cap: stream smaller flushes so the first hits the wire
+        # ~20% into the export (see _steady_flush_cap) instead of one giant flush
+        # after the whole export+gather (round 6: flush=1 at t=67s of a 98s send).
+        bkt = _FlushBucket(self._steady_flush_cap(), self._assemble_flush, _publish_steady)
 
         batch_k = self.batch_gather
 
@@ -709,7 +734,7 @@ class DeltaSyncMixin:
         ratio = (changed_elems / total_elems) if total_elems else 0.0
         logger.info(
             "delta-sharded send v=%s done in %.1fs (delta flushes=%d changed_ratio=%.4f wire=%.1fMB) "
-            "[TIMING-TX export=%.1fs gather=%.1fs publish=%.1fs entries=%d]",
+            "[TIMING-TX export=%.1fs gather=%.1fs publish=%.1fs entries=%d] wall=%.3f",
             global_steps,
             elapsed,
             n_flushes,
@@ -719,6 +744,7 @@ class DeltaSyncMixin:
             t_gather,
             t_publish,
             n_entries,
+            time.time(),
         )
         if not total_elems or not changed_elems:
             return None

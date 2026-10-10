@@ -41,7 +41,6 @@ protocol continuity with the receiver's delta_loader.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Iterator
 from unittest.mock import patch
@@ -53,6 +52,7 @@ with patch("importlib.metadata.distributions", return_value=[]):
     import cupy as cp
 
 from .base import CheckpointEngineRegistry
+from .delta_sync.encode import pack_spec
 from .delta_sync.pipeline import DeltaSyncMixin
 from .nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine, WorkerMetadata
 
@@ -153,8 +153,10 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
                 collective.broadcast(pos, src_rank=0, group_name=self.group_name)
                 collective.broadcast(val_u8, src_rank=0, group_name=self.group_name)
             val = val_u8.view(val_dtype)
-            spec_bytes = json.dumps(meta["spec"]).encode()
-            spec_t = torch.frombuffer(bytearray(spec_bytes), dtype=torch.uint8).to("cuda")
+            # [Round 7] binary spec (DSB1) instead of json.dumps; host-resident
+            # because decode reads it back to host anyway.
+            spec_bytes = pack_spec(meta["spec"])
+            spec_t = torch.frombuffer(bytearray(spec_bytes), dtype=torch.uint8)
             named = [("__delta_spec__", spec_t), ("__values__", val)]
             if pos is not None:
                 named.insert(1, ("__positions__", pos))

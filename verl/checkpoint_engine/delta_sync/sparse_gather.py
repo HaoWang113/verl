@@ -59,6 +59,24 @@ def shard_delta_indices(
     return global_idx, values
 
 
+def _pg_torch_device(group) -> torch.device:
+    """The device a process group's collectives run on (NPU/CUDA for HCCL/NCCL
+    groups, cpu for gloo). Private-API first, hardware fallbacks behind it."""
+    fn = getattr(torch.distributed, "_get_pg_default_device", None)
+    if fn is None:
+        fn = getattr(torch.distributed.distributed_c10d, "_get_pg_default_device", None)
+    if fn is not None:
+        try:
+            return fn(group)
+        except Exception:
+            pass
+    if torch.npu.is_available():
+        return torch.device("npu", torch.npu.current_device())
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def gather_slot_entries_to_rank0(
     idx_concat: torch.Tensor,
     val_concat: torch.Tensor,
@@ -74,10 +92,22 @@ def gather_slot_entries_to_rank0(
     the blobs. Rank 0 slices per (rank, param) and returns K ``(idx, val)`` pairs
     (None elsewhere) -- bit-identical to K individual gathers, ~K x fewer
     collectives and host syncs.
+
+    [Round 7] Host-resident inputs (the batched backend export diffs on host):
+    tensors are moved to the gather group's device for the collectives and rank
+    0's per-slot pieces come back on the host, so the device is a transit hop
+    only. Device-resident inputs keep the original all-device flow.
     """
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
     dst = dist.get_global_rank(group, 0) if group is not None else 0
+    host_input = idx_concat.device.type == "cpu" and group is not None
+    if host_input:
+        dev = _pg_torch_device(group)
+        if dev.type != "cpu":
+            idx_concat = idx_concat.to(dev)
+            val_concat = val_concat.to(dev)
+            counts = counts.to(dev)
     dev = idx_concat.device
     k = int(counts.numel())
 
@@ -114,7 +144,7 @@ def gather_slot_entries_to_rank0(
                 )
                 if rank == 0:
                     out_all.extend(sub)
-            return out_all if rank == 0 else None
+            return _gather_ret(out_all, rank, host_input)
 
     totals = [sum(c) for c in counts_cpu]
     max_n = max(totals) if totals else 0
@@ -123,7 +153,7 @@ def gather_slot_entries_to_rank0(
             return None
         empty_i = torch.empty(0, dtype=idx_concat.dtype, device=dev)
         empty_v = torch.empty(0, dtype=val_concat.dtype, device=dev)
-        return [(empty_i, empty_v) for _ in range(k)]
+        return _gather_ret([(empty_i, empty_v) for _ in range(k)], rank, host_input)
 
     idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
     val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
@@ -153,4 +183,15 @@ def gather_slot_entries_to_rank0(
             out.append(
                 (torch.empty(0, dtype=idx_concat.dtype, device=dev), torch.empty(0, dtype=val_concat.dtype, device=dev))
             )
-    return out
+    return _gather_ret(out, rank, host_input)
+
+
+def _gather_ret(pieces: list, rank: int, host: bool):
+    """Rank 0's return path: bring per-slot pieces back to host when the round's
+    inputs were host-resident (the batched export's flow); non-rank-0 always
+    returns None."""
+    if rank != 0:
+        return None
+    if not host:
+        return pieces
+    return [(i.cpu(), v.cpu()) for i, v in pieces]

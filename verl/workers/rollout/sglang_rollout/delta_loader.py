@@ -63,7 +63,14 @@ def apply_delta(model: torch.nn.Module, named_tensors: Iterable[tuple[str, torch
     from verl.checkpoint_engine.delta_sync.encode import checksum as _checksum
 
     tensors = dict(named_tensors)
-    spec = json.loads(bytes(tensors["__delta_spec__"].cpu().numpy().tobytes()).decode())
+    # [Round 7] DSB1 binary spec (encode.pack_spec) with JSON fallback.
+    from verl.checkpoint_engine.delta_sync.encode import _SPEC_MAGIC, unpack_spec
+
+    _raw = bytes(tensors["__delta_spec__"].cpu().numpy().tobytes())
+    if _raw[:4] == _SPEC_MAGIC:
+        spec = unpack_spec(_raw)
+    else:
+        spec = json.loads(_raw.decode())
     values = tensors["__values__"]
     positions = tensors.get("__positions__")
     if positions is None:  # values-only flush (the seed) carries no positions

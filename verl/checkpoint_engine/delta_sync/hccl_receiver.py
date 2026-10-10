@@ -25,7 +25,6 @@ flags (:func:`wait_delta_wire_ready`) before its first publish.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -35,6 +34,8 @@ import zmq
 
 from verl.utils.distributed import stateless_init_process_group
 from verl.utils.net_utils import is_valid_ipv6_address
+
+from .encode import pack_spec
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,11 @@ def _pump_dense_seed_buckets(
     merging: dict = {}
     n_buckets = 0
     n_tensors = 0
+    # [TIMING-T2 2026-10-10] bcast (wire) vs apply (weight_loader) split, same
+    # scope as the indices pump's session totals, so the full seed and the
+    # steady delta rounds report data-transfer time on one yardstick.
+    bcast_total = 0.0
+    apply_total = 0.0
     try:
         while True:
             if sub.poll(int(MANIFEST_RECV_TIMEOUT_SECONDS * 1000)) == 0:
@@ -181,28 +187,35 @@ def _pump_dense_seed_buckets(
                 )
             sub.recv_string()
             bmeta = sub.recv_pyobj()
+            _tb = time.monotonic()
             comm.broadcast(recv_buf, src=0)
             synchronize()
+            bcast_total += time.monotonic() - _tb
             # swap: read the bucket just received from send_buf while the next
             # broadcast lands in recv_buf (stream ordering keeps the views of
             # the previous bucket valid through ``on_buckets``)
             send_buf, recv_buf = recv_buf, send_buf
             n_buckets += 1
+            _ta = time.monotonic()
             named = _collect_bucket_tensors(send_buf, bmeta["bucket_meta"], merging, bucket_size)
             if named:
                 on_buckets(named)
                 n_tensors += len(named)
+            apply_total += time.monotonic() - _ta
             if bmeta.get("is_last"):
                 break
     finally:
         del send_buf, recv_buf
     assert not merging, f"dense seed ended with incomplete tensors: {sorted(merging)}"
     logger.warning(
-        "delta-hccl pump rank=%s DENSE-SEED done in %.1fs (buckets=%d tensors=%d)",
+        "delta-hccl pump rank=%s DENSE-SEED done in %.1fs (buckets=%d tensors=%d) "
+        "[TIMING-T2 bcast_total=%.1fs apply_total=%.1fs]",
         rank_tag,
         time.monotonic() - t0,
         n_buckets,
         n_tensors,
+        bcast_total,
+        apply_total,
     )
 
 
@@ -237,6 +250,12 @@ def pump_hccl_delta_session(
     synchronize = getattr(torch, device.type).synchronize
     encoding = "indices"
     flush_seq = 0
+    # [TIMING-T2 2026-10-10] Per-session wire (bcast) vs apply totals: the
+    # receiver-measured broadcast time is the honest "data transfer" number for
+    # the T1/T2/T3 sync-cost decomposition (T2), on the same yardstick as the
+    # dense seed's DENSE-SEED totals.
+    bcast_total = 0.0
+    apply_total = 0.0
     logger.warning("delta-hccl pump rank=%s session START", rank_tag)
     try:
         while True:
@@ -264,13 +283,15 @@ def pump_hccl_delta_session(
             elem = torch.empty(0, dtype=val_dtype).element_size()
             val_u8 = torch.empty(meta["val_numel"] * elem, dtype=torch.uint8, device=device)
             logger.warning(
-                "delta-hccl pump rank=%s flush=%d enc=%s pos=%d val=%d last=%s: manifest in, entering broadcast",
+                "delta-hccl pump rank=%s flush=%d enc=%s pos=%d val=%d last=%s: "
+                "manifest in, entering broadcast wall=%.3f",
                 rank_tag,
                 flush_seq,
                 encoding,
                 meta.get("pos_numel", 0),
                 meta["val_numel"],
                 meta["is_last"],
+                time.time(),
             )
             t_bcast = time.monotonic()
             if dense:
@@ -283,26 +304,39 @@ def pump_hccl_delta_session(
             synchronize()
             t_apply = time.monotonic()
             bcast_seconds = t_apply - t_bcast
+            bcast_total += bcast_seconds
             val = val_u8.view(val_dtype)
-            spec_bytes = json.dumps(meta["spec"]).encode()
-            spec_t = torch.frombuffer(bytearray(spec_bytes), dtype=torch.uint8).to(device)
+            # [Round 7] binary spec (DSB1) instead of json.dumps -- ~2.5s/flush
+            # at 15k patches; kept host-resident because decode reads it back to
+            # host anyway (the old .to(device) was a pure H2D+D2H round trip).
+            spec_bytes = pack_spec(meta["spec"])
+            spec_t = torch.frombuffer(bytearray(spec_bytes), dtype=torch.uint8)
             named = [("__delta_spec__", spec_t), ("__values__", val)]
             if pos is not None:
                 named.insert(1, ("__positions__", pos))
             on_flush(named)
             apply_seconds = time.monotonic() - t_apply
+            apply_total += apply_seconds
             logger.warning(
-                "delta-hccl pump rank=%s flush=%d APPLIED bcast=%.1fs apply=%.1fs%s",
+                "delta-hccl pump rank=%s flush=%d APPLIED bcast=%.1fs apply=%.1fs%s wall=%.3f",
                 rank_tag,
                 flush_seq,
                 bcast_seconds,
                 apply_seconds,
                 " (SLOW)" if apply_seconds > SLOW_FLUSH_SECONDS else "",
+                time.time(),
             )
             del pos, val_u8, val, spec_t
             flush_seq += 1
             if meta["is_last"]:
-                logger.warning("delta-hccl pump rank=%s session END after %d flush(es)", rank_tag, flush_seq)
+                logger.warning(
+                    "delta-hccl pump rank=%s session END after %d flush(es) "
+                    "[TIMING-T2 bcast_total=%.1fs apply_total=%.1fs]",
+                    rank_tag,
+                    flush_seq,
+                    bcast_total,
+                    apply_total,
+                )
                 break
     except BaseException:
         logger.exception("delta-hccl pump rank=%s FAILED at flush=%d", rank_tag, flush_seq)

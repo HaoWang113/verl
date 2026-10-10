@@ -286,23 +286,13 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        # [TIMING-SERVER 2026-10-10] Entry stamp for the weight-update lifecycle
-        # RPCs: the delta between the adapter's dispatch (see [TIMING-ADAPTER])
-        # and this entry is the server actor mailbox/queue lag -- round 5
-        # (raysubmit_vm8W34zfzVDfh3aK) showed ~5min between the trainer's send
-        # completion and the worker pumps starting, with the engines idle.
-        _method_name = method if isinstance(method, str) else getattr(method, "__name__", repr(method))
-        if isinstance(_method_name, str) and "verl_delta" in _method_name:
-            logger.warning("[TIMING-SERVER] collective_rpc %s enter", _method_name)
-            _t_srv = time.monotonic()
-            await self.engine.collective_rpc(
-                method=method,
-                timeout=timeout,
-                args=args,
-                kwargs=kwargs,
-            )
-            logger.warning("[TIMING-SERVER] collective_rpc %s done in %.1fs", _method_name, time.monotonic() - _t_srv)
-            return
+        # [Round 7] The round-6 [TIMING-SERVER] stamps that lived here never
+        # reached ray job logs: this actor's logging is reconfigured by the
+        # vllm/uvicorn startup (module loggers disabled), so the lines were
+        # dead. The question they chased is answered (round 6: no server
+        # mailbox lag -- the round-5 "5-minute gap" was node clock skew), and
+        # the worker-side [TIMING-EPOCH] stamps (delta_weight_transfer /
+        # hccl_receiver) now cover engine-side wall-clock alignment.
         await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
