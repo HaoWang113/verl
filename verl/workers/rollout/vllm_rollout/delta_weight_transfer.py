@@ -473,16 +473,37 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
         # wire, so NO receiver can apply the patch. Fail loud with the fix
         # pointer instead of mis-slicing inside the fused loader (whole-layer
         # 3D fused tensors are legit and still take the loader path below).
-        for patch in remaining_patches:
-            if len(patch.shape) == 2 and _FUSED_EXPERT_NAME_RE.search(patch.name):
-                raise NotImplementedError(
-                    f"delta wire carries fused-name expert patch {patch.name!r} with per-expert shape "
-                    f"{tuple(patch.shape)}: the expert id is not on the wire, so no receiver can apply it. "
-                    "The trainer-side MoE delta export must emit per-expert HF names "
-                    "(default_moe_param_handler: '...mlp.experts.{id}.gate_proj.weight' [N, K], up_proj, "
-                    "down_proj, or '...mlp.experts.{id}.gate_up_proj' [2N, K]); qwen3_5.load_weights' fused "
-                    "branch only accepts whole-layer 3D [num_experts, 2N, K] tensors under 'experts.gate_up_proj'."
-                )
+        # [FAIL-LOUD 2026-10-10] A PER-EXPERT name that direct-write declined
+        # must also fail loud on a fused-expert model: the model loader cannot
+        # apply it either (the fused-expert loader silently skips per-expert
+        # names, "not found in params_dict, skip loading" -- observed 808x +
+        # 51713 dedup-collapsed on raysubmit_GDrzYzFhu4B7rATx, leaving expert
+        # weights silently stale). Defense in depth under
+        # apply_expert_patch_direct's own fail-loud module lookup.
+        if remaining_patches:
+            from verl.workers.rollout.vllm_rollout.moe_online_update import (
+                iter_expert_weight_modules,
+                parse_expert_patch_name,
+            )
+
+            _has_fused_experts = next(iter_expert_weight_modules(self.model), None) is not None
+            for patch in remaining_patches:
+                if len(patch.shape) == 2 and _FUSED_EXPERT_NAME_RE.search(patch.name):
+                    raise NotImplementedError(
+                        f"delta wire carries fused-name expert patch {patch.name!r} with per-expert shape "
+                        f"{tuple(patch.shape)}: the expert id is not on the wire, so no receiver can apply it. "
+                        "The trainer-side MoE delta export must emit per-expert HF names "
+                        "(default_moe_param_handler: '...mlp.experts.{id}.gate_proj.weight' [N, K], up_proj, "
+                        "down_proj, or '...mlp.experts.{id}.gate_up_proj' [2N, K]); qwen3_5.load_weights' fused "
+                        "branch only accepts whole-layer 3D [num_experts, 2N, K] tensors under 'experts.gate_up_proj'."
+                    )
+                if _has_fused_experts and parse_expert_patch_name(patch.name) is not None:
+                    raise NotImplementedError(
+                        f"delta wire carries per-expert patch {patch.name!r} {tuple(patch.shape)} that "
+                        "apply_expert_patch_direct did not apply, and the model loader cannot apply per-expert "
+                        "names on a fused-expert model (the fused-expert loader skips them silently). Restart "
+                        "with the direct-write lookup fixed; refusing to report success with stale expert weights."
+                    )
         if remaining_patches:
             # The trusted producer emits every changed position at most once;
             # skip vLLM's sort-based duplicate check on the rollout GPU.
@@ -561,17 +582,29 @@ class VerlDeltaIPCWeightTransferEngine(WeightTransferEngine):
                 self._sparse_session_begun = False
         elif self._session_encoding == "dense_buckets":
             # [FIX 2026-10-06] Re-run process_weights_after_loading to align with
-            # nccl baseline (utils.py:382-385). Without this, MoE expert weights
-            # stay in checkpoint layout loaded into runtime-layout (transposed)
-            # params, causing double-transpose and K-dim mismatch (2048 vs 1024)
-            # in aclnnGroupedMatmulV5 (error 161002 ACLNN_ERR_PARAM_INVALID).
+            # nccl baseline (utils.py:382-385).
+            # [FIX2 2026-10-10] The vllm util does NOT reach the vllm-ascend
+            # fused-MoE weights (confirmed: post-finish w13 stayed at checkpoint
+            # layout (128, 1024, 2048) while the kernel path requires runtime
+            # (128, 2048, 1024) -- aclnnGroupedMatmulV5 161002 on the first
+            # post-seed forward, raysubmit_GDrzYzFhu4B7rATx). Each seed expert
+            # write went through verl's NPU weight-loader wrapper, which
+            # transposes runtime params to checkpoint layout before writing, so
+            # restore the runtime layout explicitly here.
             try:
                 from vllm.model_executor.model_loader.utils import (
                     process_weights_after_loading,
                 )
-                logger.warning("[FIX-DIAG] dense_buckets finish_weight_update: calling process_weights_after_loading to restore checkpoint layout")
+                logger.warning("[FIX-DIAG] dense_buckets finish_weight_update: calling process_weights_after_loading")
                 process_weights_after_loading(self.model, self.model_config, self.device)
                 logger.warning("[FIX-DIAG] dense_buckets finish_weight_update: process_weights_after_loading done")
+                from verl.workers.rollout.vllm_rollout.moe_online_update import restore_expert_runtime_layout
+
+                n_restored = restore_expert_runtime_layout(self.model)
+                logger.warning(
+                    "[FIX2-DIAG] dense_buckets finish_weight_update: restored %d expert param(s) to runtime layout",
+                    n_restored,
+                )
             except BaseException:
                 self._update_failed = True
                 raise

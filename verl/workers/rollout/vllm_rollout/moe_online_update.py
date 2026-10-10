@@ -23,6 +23,21 @@ load-time transforms when the window closes. The flips rebind through
 attribute the sparse apply's ``model.load_weights`` re-entry reads --
 survives every open/restore cycle.
 
+RUNTIME-AT-REST CONTRACT (confirmed 2026-10-10, raysubmit_GDrzYzFhu4B7rATx):
+the unquantized Ascend kernel path feeds the live expert parameter straight
+into ``torch_npu.npu_grouped_matmul`` without transposition
+(``fused_moe.py:apply`` -> ``build_fused_experts_input`` leaves ``need_trans``
+at its False default), and that op requires ``weight.dim(1) == hidden_size``
+-- i.e. the live w13 must rest at vllm-ascend's transposed RUNTIME layout
+``[E, K, 2N]`` between weight-update sessions. Leaving it at checkpoint
+layout ``[E, 2N, K]`` crashes the first forward with aclnnGroupedMatmulV5
+161002 ("Dim 1 value of x[0] should be equal with dim 1 value of weight[0],
+but now is 2048 and 1024 respectively" -- observed on a rollout rank whose
+dense-bucket seed had left w13 checkpoint-layout, Qwen3.5-35B-A3B:
+E_local=128, 2N=1024, K=2048). Therefore every window CLOSE (and the
+dense-bucket seed finish) must restore runtime layout, including for params
+that already sat at checkpoint layout when the window opened.
+
 Both certified vllm-ascend shapes (0.23.x and the anchored modular layout)
 share the same ND main path and the pad step is a no-op on NPU (vllm core
 ``_maybe_pad_weight`` is ROCm-only), so the window is a pure shape
@@ -53,13 +68,38 @@ _LIST_SPLIT_ATTRS = ("w13_weight_list", "w2_weight_list")
 class ExpertLayoutWindow:
     """Expert-weight parameters currently held at checkpoint layout.
 
-    Tracks the ``(layer, param_name)`` pairs the open pass actually flipped.
-    Params that already sat at checkpoint layout (qwen3.5 on vllm-ascend
-    0.23.0rc1 -- the host never transposes it) are NOT flipped and must NOT be
-    transposed back at close time.
+    Tracks every ``(layer, param_name)`` pair the open pass normalized to
+    checkpoint layout -- both the ones it actually flipped from runtime
+    layout and the ones that already sat at checkpoint layout. ALL of them
+    are transposed back to runtime layout at close time: the Ascend
+    unquantized kernel path requires runtime-resting expert weights (see
+    the module docstring), so a param that entered the window already at
+    checkpoint layout (e.g. left there by the dense-bucket seed's
+    weight-loader wrapper transpose) must not stay there after close.
     """
 
-    flipped: list[tuple[torch.nn.Module, str]] = field(default_factory=list)
+    at_checkpoint: list[tuple[torch.nn.Module, str]] = field(default_factory=list)
+
+
+_HF_VLLM_PREFIX_PAIRS = (
+    # HF checkpoint names vs vLLM module qualnames for the multimodal wrapper
+    # models (qwen3_5.py): HF nests ``model.language_model`` / ``model.visual``
+    # while vLLM nests ``language_model.model`` / ``visual``. Confirmed on the
+    # 4+2 cluster: wire 'model.language_model.layers.0.mlp.experts.{id}...'
+    # vs live param 'language_model.model.layers.0.mlp.experts.w13_weight'.
+    ("model.language_model.", "language_model.model."),
+    ("model.visual.", "visual."),
+)
+
+
+def _layer_prefix_candidates(layer_prefix: str):
+    """Yield the wire prefix plus its HF<->vLLM remaps for module matching."""
+    yield layer_prefix
+    for hf_prefix, vllm_prefix in _HF_VLLM_PREFIX_PAIRS:
+        if layer_prefix.startswith(hf_prefix):
+            yield vllm_prefix + layer_prefix[len(hf_prefix):]
+        elif layer_prefix.startswith(vllm_prefix):
+            yield hf_prefix + layer_prefix[len(vllm_prefix):]
 
 
 def _module_hidden_size(layer: torch.nn.Module) -> int:
@@ -240,24 +280,22 @@ def _assert_layer_supported(layer: torch.nn.Module) -> None:
 
 
 def prepare_expert_weights_for_online_update(layer: torch.nn.Module, window: ExpertLayoutWindow) -> None:
-    """Flip this layer's expert weights to checkpoint layout -- ONLY the params
-    that currently sit at vllm-ascend's transposed runtime layout.
+    """Normalize this layer's expert weights to checkpoint layout and record
+    EVERY normalized param for the close-time runtime restore.
 
-    Runtime layouts (transposing hosts, post ``process_weights_after_loading``):
-    w13 ``[E, K, 2N]`` / w2 ``[E, N, K]``, detected by the same signature the
-    NPU weight-loader wrapper uses (dim-1 == hidden_size for w13, dim-2 ==
-    hidden_size for w2). Checkpoint layouts: w13 ``[E, 2N, K]`` / w2
-    ``[E, K, N]`` (TP-narrowed variants included). qwen3.5 on vllm-ascend
-    0.23.0rc1 is NOT transposed by the host (the loader carries the comment
-    "qwen3.5 no need to transpose"), so its live params already sit at
-    checkpoint layout at window open -- observed on the 4+2 cluster as w13
-    (128, 1024, 2048) = [E, 2N/TP, K]. Unconditionally flipping such a param
-    (a) puts the live parameter into runtime layout, (b) makes dim-1 equal
-    hidden_size, which arms verl's own npu_vllm_patch wrapper to transpose
-    param.data BACK on the first weight_loader call (observed: the crash dest
-    (512, 2048) is the un-flipped w1 slot), and (c) leaves the window-close
-    restore double-transposing. So: flip only what the runtime signature
-    matches, record it, and restore exactly that.
+    Runtime layout (transposing hosts, post ``process_weights_after_loading``):
+    w13 ``[E, K, 2N]`` / w2 ``[E, N, K]``, detected by dim-1 == hidden_size
+    for w13 / dim-2 == hidden_size for w2 (the same signature verl's NPU
+    weight-loader wrapper uses). Checkpoint layout: w13 ``[E, 2N, K]`` / w2
+    ``[E, K, N]`` (TP-narrowed variants included).
+
+    Both branches record into ``window.at_checkpoint``: the close pass
+    restores runtime layout unconditionally, because the Ascend unquantized
+    kernel path (``npu_grouped_matmul`` with ``need_trans=False``) crashes on
+    checkpoint-resting expert weights (aclnnGroupedMatmulV5 161002, confirmed
+    2026-10-10). A param that already sits at checkpoint layout at open time
+    is an artifact of the dense-bucket seed's weight-loader wrapper
+    transpose, not a native resting state.
     """
     _assert_layer_supported(layer)
     _assert_nz_inactive()
@@ -266,20 +304,32 @@ def prepare_expert_weights_for_online_update(layer: torch.nn.Module, window: Exp
     w2 = layer.w2_weight.data
     w13_flipped = w13.shape[1] == hidden
     w2_flipped = w2.shape[2] == hidden
-    # [DIAG-WINDOW 2026-10-08] Log the per-param flip decision at window open.
-    # "no-flip" means the live param already sits at checkpoint layout (the
-    # qwen3.5 case); flipping it would fight the npu_vllm_patch wrapper and
-    # double-transpose at close. Pair with [DIAG-DELTA]/[DIAG-EXPERT] on the
-    # apply path to confirm patch coordinates match the live layout.
+    if not w13_flipped and w13.shape[2] != hidden:
+        raise NotImplementedError(
+            f"{type(layer).__name__} w13 {tuple(w13.shape)} matches neither the runtime signature [E, K, 2N] "
+            f"(dim-1 == hidden_size={hidden}) nor the checkpoint signature [E, 2N, K] (dim-2 == hidden_size); "
+            "refusing to guess the expert weight layout."
+        )
+    if not w2_flipped and w2.shape[1] != hidden:
+        raise NotImplementedError(
+            f"{type(layer).__name__} w2 {tuple(w2.shape)} matches neither the runtime signature [E, N, K] "
+            f"(dim-2 == hidden_size={hidden}) nor the checkpoint signature [E, K, N] (dim-1 == hidden_size); "
+            "refusing to guess the expert weight layout."
+        )
+    # [DIAG-WINDOW 2026-10-08] Log the per-param normalization decision at
+    # window open. Both branches are restored to runtime layout at close:
+    # "already checkpoint" is a seed artifact, not a resting state (see the
+    # module docstring). Pair with [DIAG-DELTA]/[DIAG-EXPERT] on the apply
+    # path to confirm patch coordinates match the live layout.
     try:
         logger.warning(
             "[DIAG-WINDOW prepare] layer=%s hidden=%d w13=%s -> %s | w2=%s -> %s",
             type(layer).__name__,
             hidden,
             tuple(w13.shape),
-            tuple(w13.transpose(1, 2).shape) if w13_flipped else "no-flip (already checkpoint layout)",
+            "flip to checkpoint" if w13_flipped else "already checkpoint (restore at close)",
             tuple(w2.shape),
-            tuple(w2.transpose(1, 2).shape) if w2_flipped else "no-flip (already checkpoint layout)",
+            "flip to checkpoint" if w2_flipped else "already checkpoint (restore at close)",
         )
     except Exception:
         pass
@@ -287,15 +337,16 @@ def prepare_expert_weights_for_online_update(layer: torch.nn.Module, window: Exp
     # stays at this single layer's size.
     if w13_flipped:
         _replace_parameter(layer, "w13_weight", w13.transpose(1, 2).contiguous())
-        window.flipped.append((layer, "w13_weight"))
     if w2_flipped:
         _replace_parameter(layer, "w2_weight", w2.transpose(1, 2).contiguous())
-        window.flipped.append((layer, "w2_weight"))
+    window.at_checkpoint.append((layer, "w13_weight"))
+    window.at_checkpoint.append((layer, "w2_weight"))
     del w13, w2
 
 
 def restore_expert_param_after_online_update(layer: torch.nn.Module, param_name: str) -> None:
-    """Replay the load-time transform for one flipped expert param (ND main path)."""
+    """Replay the load-time transform for one windowed expert param (checkpoint
+    -> runtime, ND main path)."""
     data = getattr(layer, param_name).data
     _replace_parameter(layer, param_name, data.transpose(1, 2).contiguous())
     del data
@@ -324,26 +375,76 @@ def open_expert_layout_window(model: torch.nn.Module) -> ExpertLayoutWindow | No
 
 
 def close_expert_layout_window(window: ExpertLayoutWindow) -> None:
-    """Close the window: replay the load-time transform for exactly the params
-    the open pass flipped. Params that already sat at checkpoint layout were
-    never flipped and must not be transposed back."""
-    for layer, param_name in window.flipped:
+    """Close the window: replay the load-time transform (checkpoint -> runtime)
+    for every param the open pass normalized to checkpoint layout.
+
+    The restore is unconditional for all recorded params: the Ascend
+    unquantized kernel path requires runtime-resting expert weights, so
+    params that entered the window already at checkpoint layout must be
+    transposed too (leaving them at checkpoint crashes the next forward with
+    aclnnGroupedMatmulV5 161002).
+    """
+    for layer, param_name in window.at_checkpoint:
         restore_expert_param_after_online_update(layer, param_name)
-    window.flipped.clear()
+    window.at_checkpoint.clear()
+
+
+def restore_expert_runtime_layout(model: torch.nn.Module) -> int:
+    """Transpose every checkpoint-resting fused-expert param back to runtime
+    layout (ND main path), for session finishes that bypass the sparse window.
+
+    Used by the dense-bucket seed finish: each expert ``weight_loader`` write
+    went through verl's NPU wrapper, which transposes runtime params to
+    checkpoint layout before writing, so the seed leaves the live expert
+    weights at checkpoint layout while the kernel path requires runtime
+    (vllm's ``process_weights_after_loading`` util does not reach the
+    vllm-ascend fused-MoE weights). Params already at runtime layout are
+    left untouched. Returns the number of transposed params.
+    """
+    n_restored = 0
+    for layer in iter_expert_weight_modules(model):
+        _assert_layer_supported(layer)
+        hidden = _module_hidden_size(layer)
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        # Checkpoint signatures: w13 [E, 2N, K] (dim-2 == hidden), w2 [E, K, N]
+        # (dim-1 == hidden). Runtime: w13 [E, K, 2N] (dim-1 == hidden), w2
+        # [E, N, K] (dim-2 == hidden).
+        if w13.shape[1] != hidden and w13.shape[2] == hidden:
+            _replace_parameter(layer, "w13_weight", w13.transpose(1, 2).contiguous())
+            n_restored += 1
+        if w2.shape[2] != hidden and w2.shape[1] == hidden:
+            _replace_parameter(layer, "w2_weight", w2.transpose(1, 2).contiguous())
+            n_restored += 1
+        del w13, w2
+    return n_restored
 
 
 # ---- per-expert direct-apply (bypass model.load_weights fused-expert loader) ----
 # CONFIRMED on the 4+2 NPU cluster (raysubmit_UMB8tQQKKLLLW1Qf, 2026-10-09):
 # the steady delta wire carries PER-EXPERT MoE patches -- single-expert shapes
-# like [2N, K] (Qwen3.5-35B-A3B: E=128, N=512, K=2048, live w13 [E, 2N, K] =
-# (128, 1024, 2048) as observed on the rollout ranks, expert dims unsharded)
-# -- under per-expert HF names ('...mlp.experts.{id}.gate_proj.weight', what
-# verl's default_moe_param_handler emits) or per-expert fused names
-# ('...mlp.experts.{id}.gate_up_proj' [2N, K], gpt_oss streamed style).
-# Layout reading verified by the observed crash arithmetic: the 2D (1024,
-# 2048) fused patch made qwen3_5's fused loader chunk(2, dim=-2) -> (512,
-# 2048) w1 half, then loaded_weight[expert_id] sliced a single (2048,) row
-# toward the (512, 2048) w1 slot -- hence dest (512, 2048) != src (2048,).
+# like [2N, K] (Qwen3.5-35B-A3B: E_global=256, E_local=128 per rollout rank at
+# gen_ep=2, N=512, K=2048, live w13 [E_local, 2N, K] = (128, 1024, 2048)) --
+# under per-expert fused names ('...mlp.experts.{gid}.gate_up_proj' [2N, K] /
+# '...mlp.experts.{gid}.down_proj' [K, N], global expert ids from the
+# trainer-side re-key, commit 07533d4f). Layout reading verified by the
+# observed crash arithmetic: the 2D (1024, 2048) fused patch made qwen3_5's
+# fused loader chunk(2, dim=-2) -> (512, 2048) w1 half, then
+# loaded_weight[expert_id] sliced a single (2048,) row toward the (512, 2048)
+# w1 slot -- hence dest (512, 2048) != src (2048,).
+#
+# CONFIRMED on the 4+2 NPU cluster (raysubmit_GDrzYzFhu4B7rATx, 2026-10-10):
+# the module lookup MUST remap the HF wire prefix to the vLLM module tree.
+# The wire name 'model.language_model.layers.0.mlp.experts.13.gate_up_proj'
+# parses to layer_prefix 'model.language_model.layers.0.mlp.experts', but the
+# live module qualname is 'language_model.model.layers.0.mlp.experts' (vllm
+# qwen3_5.py nests language_model.model.layers while HF nests
+# model.language_model.layers). With the exact-qualname lookup every
+# per-expert patch returned False, fell to the model loader, and
+# qwen3_5.py:420 silently skipped all of them ("Parameter
+# layers.N.mlp.experts.{gid}.down_proj not found in params_dict, skip
+# loading" -- 808 logged + 51713 dedup-collapsed across the cluster), so the
+# expert weights were never updated while the sync reported success.
 #
 # qwen3_5.load_weights' fused branch accepts ONLY whole-layer 3D [E, 2N, K]
 # tensors under the id-less fused name 'experts.gate_up_proj' (it does
@@ -388,8 +489,12 @@ def parse_expert_patch_name(name: str):
 def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, values, indices) -> bool:
     """Apply one sparse per-expert patch directly into the checkpoint-layout live
     parameter, bypassing ``model.load_weights``. Returns ``True`` if the patch
-    was applied here (or intentionally skipped on this rank), ``False`` if it is
-    not a per-expert patch (caller should fall back to the normal loader path).
+    was applied here (or intentionally skipped on this rank), ``False`` if the
+    caller should fall back to the normal loader path: non-per-expert names,
+    or per-expert names on a model with no fused-expert modules (ordinary
+    per-expert parameters the loader applies). Raises on a fused-expert model
+    when no module matches the (remapped) layer prefix -- the loader would
+    silently skip the patch there.
 
     The sparse window guarantees the live parameters sit at checkpoint layout
     at apply time: ``w13_weight`` = [E, 2N, K], ``w2_weight`` = [E, K, N]
@@ -406,20 +511,51 @@ def apply_expert_patch_direct(model: torch.nn.Module, name: str, shape, dtype, v
     layer_prefix, expert_id, proj = parsed
 
     # Find the fused-expert module matching this layer_prefix. ``layer_prefix``
-    # is e.g. "model.layers.0.mlp.experts"; the FusedMoE module is the one whose
-    # qualname equals layer_prefix (or starts with it under base_layer wrapping).
+    # comes from the HF checkpoint name on the wire, e.g.
+    # "model.language_model.layers.0.mlp.experts", while the vLLM module tree
+    # for the multimodal wrapper nests the same module as
+    # "language_model.model.layers.0.mlp.experts" (confirmed 2026-10-10: the
+    # exact-qualname-only lookup below returned None for every per-expert
+    # patch, all 9145 v=1 patches fell through to the model loader, and
+    # qwen3_5.py:420 silently skipped every one of them -- "not found in
+    # params_dict, skip loading"). Match the wire prefix plus its HF<->vLLM
+    # remaps; fail loud when nothing matches, because per-expert names have
+    # no other apply path.
+    candidates = list(_layer_prefix_candidates(layer_prefix))
     target_module = None
     for mod_qualname, module in model.named_modules():
-        if mod_qualname == layer_prefix or mod_qualname.startswith(layer_prefix + "."):
+        if any(
+            mod_qualname == cand or mod_qualname.startswith(cand + ".") for cand in candidates
+        ):
             if getattr(module, "w13_weight", None) is not None or getattr(module, "w13_weight_list", None) is not None:
                 target_module = module
                 break
     if target_module is None:
-        return False
+        # A model with NO fused-expert modules holds per-expert weights as
+        # ordinary parameters, so the model loader is the legitimate apply
+        # path for per-expert names. But on a fused-expert model (qwen3_5:
+        # params_dict carries w13_weight/w2_weight, never per-expert names)
+        # an unmatched prefix means the loader will silently skip the patch
+        # -- fail loud instead (confirmed 2026-10-10: 808 logged + 51713
+        # dedup-collapsed "not found in params_dict, skip loading" skips
+        # left every expert weight stale while the sync reported success).
+        if next(iter_expert_weight_modules(model), None) is None:
+            return False
+        raise NotImplementedError(
+            f"apply_expert_patch_direct({name!r}): no fused-expert module matches the layer prefix "
+            f"(tried {candidates}) although the model carries fused-expert modules. Per-expert patches "
+            "cannot fall back to the model loader on a fused-expert model -- vllm's fused-expert loader "
+            "only accepts whole-layer 3D tensors under the id-less fused name and silently skips "
+            "per-expert names ('not found in params_dict, skip loading')."
+        )
     w13 = getattr(target_module, "w13_weight", None)
     w2 = getattr(target_module, "w2_weight", None)
     if w13 is None or w2 is None:
-        return False
+        raise NotImplementedError(
+            f"apply_expert_patch_direct({name!r}): matched fused-expert module "
+            f"{type(target_module).__name__} exposes no Parameter-typed w13_weight/w2_weight (per-expert "
+            "weight-list variant?); the model loader cannot apply per-expert names on a fused-expert model."
+        )
 
     # EP: map the global expert_id to the local physical id. If this expert is
     # not on this rank (EP-sharded), skip it (the HCCL broadcast reaches every
