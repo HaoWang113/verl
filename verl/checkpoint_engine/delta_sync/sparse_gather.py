@@ -94,9 +94,14 @@ def gather_slot_entries_to_rank0(
     collectives and host syncs.
 
     [Round 7] Host-resident inputs (the batched backend export diffs on host):
-    tensors are moved to the gather group's device for the collectives and rank
-    0's per-slot pieces come back on the host, so the device is a transit hop
-    only. Device-resident inputs keep the original all-device flow.
+    tensors are moved to the gather group's device for the collectives.
+    [Round 8] Rank 0's per-slot pieces STAY on that device: they feed the
+    wire-side bucket/assemble/broadcast, which is device-resident end to end.
+    Round 7 brought them back to the host with one pageable ``.cpu()`` per
+    slot -- ~2 x 17k synchronizing D2H copies per sync on rank 0 (observed
+    raysubmit_wKmFfrWNiRq6wu4a: gather 116-135s, flat in the changed ratio),
+    i.e. the per-param device-sync disease this module was built to avoid,
+    reintroduced on the return path.
     """
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
@@ -144,7 +149,7 @@ def gather_slot_entries_to_rank0(
                 )
                 if rank == 0:
                     out_all.extend(sub)
-            return _gather_ret(out_all, rank, host_input)
+            return _gather_ret(out_all, rank)
 
     totals = [sum(c) for c in counts_cpu]
     max_n = max(totals) if totals else 0
@@ -153,7 +158,7 @@ def gather_slot_entries_to_rank0(
             return None
         empty_i = torch.empty(0, dtype=idx_concat.dtype, device=dev)
         empty_v = torch.empty(0, dtype=val_concat.dtype, device=dev)
-        return _gather_ret([(empty_i, empty_v) for _ in range(k)], rank, host_input)
+        return _gather_ret([(empty_i, empty_v) for _ in range(k)], rank)
 
     idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
     val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
@@ -183,15 +188,12 @@ def gather_slot_entries_to_rank0(
             out.append(
                 (torch.empty(0, dtype=idx_concat.dtype, device=dev), torch.empty(0, dtype=val_concat.dtype, device=dev))
             )
-    return _gather_ret(out, rank, host_input)
+    return _gather_ret(out, rank)
 
 
-def _gather_ret(pieces: list, rank: int, host: bool):
-    """Rank 0's return path: bring per-slot pieces back to host when the round's
-    inputs were host-resident (the batched export's flow); non-rank-0 always
-    returns None."""
+def _gather_ret(pieces: list, rank: int):
+    """Rank filter for the gather return: rank 0 gets the per-slot pieces
+    (device-resident, [Round 8]); every other rank gets None."""
     if rank != 0:
         return None
-    if not host:
-        return pieces
-    return [(i.cpu(), v.cpu()) for i, v in pieces]
+    return pieces

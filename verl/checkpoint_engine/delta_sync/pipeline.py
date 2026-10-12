@@ -157,7 +157,7 @@ class _GatherQueue:
     and deadlocks NCCL). Byte bounding happens INSIDE the batched gather via
     ``max_round_bytes``, decided from the all-gathered counts every rank sees."""
 
-    __slots__ = ("batch_k", "max_round_bytes", "is_r0", "_consume", "_queues")
+    __slots__ = ("batch_k", "max_round_bytes", "is_r0", "_consume", "_queues", "stats")
 
     def __init__(self, batch_k: int, max_round_bytes: int, is_r0: bool, consume):
         self.batch_k = max(int(batch_k), 1)
@@ -165,6 +165,12 @@ class _GatherQueue:
         self.is_r0 = is_r0
         self._consume = consume
         self._queues: dict[int, tuple] = {}  # id(pg) -> (pg, [entries])
+        # [Round 8] per-phase cost split of the gather rounds (all ranks run the
+        # collectives; only rank 0 runs consume) -- separates the wire/collective
+        # time from the host prep and the bucketing, which round 7's single
+        # t_gather number could not (the 116-135s it showed was dominated by the
+        # since-removed per-slot .cpu() return path, not the wire).
+        self.stats = {"rounds": 0, "prep": 0.0, "coll": 0.0, "consume": 0.0}
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
         _pg, entries = self._queues.setdefault(id(pg), (pg, []))
@@ -194,12 +200,18 @@ class _GatherQueue:
                         off += c
             return
         dev = batch[0][3].device
+        _tp = time.monotonic()
         counts_concat = torch.cat([c for _, _, c, _, _ in batch]).to(dev)
         idx_concat = torch.cat([i for _, _, _, i, _ in batch])
         val_concat = torch.cat([v for _, _, _, _, v in batch])
+        _tc = time.monotonic()
         gathered = gather_slot_entries_to_rank0(
             idx_concat, val_concat, counts_concat, group=pg, max_round_bytes=self.max_round_bytes
         )
+        self.stats["rounds"] += 1
+        self.stats["prep"] += _tc - _tp
+        self.stats["coll"] += time.monotonic() - _tc
+        _tu = time.monotonic()
         if self.is_r0 and gathered is not None:
             slot_i = 0
             for slots, dtype_str, _counts, _i, _v in batch:
@@ -207,6 +219,7 @@ class _GatherQueue:
                     aidx, aval = gathered[slot_i]
                     slot_i += 1
                     self._consume(name, dtype_str, tuple(shape), _prodshape(shape), aidx, aval)
+        self.stats["consume"] += time.monotonic() - _tu
 
 
 class DeltaSyncMixin:
@@ -235,7 +248,7 @@ class DeltaSyncMixin:
     # is transparent); 64M elements bounds the transient to ~512 MiB.
     MAX_ENTRY_ELEMS = 64 << 20
 
-    def __init__(self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0,
+    def __init__(self, *args, encoding: str = "indices", batch_gather: int = 256, verify_every: int = 0,
                  steady_flush_megabytes: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         assert encoding == "indices", f"delta_sharded ships only the 'indices' position encoding; got {encoding!r}"
@@ -245,7 +258,13 @@ class DeltaSyncMixin:
         self._shard_seeded = False
         # Gather the per-param sparse deltas in groups of this many parameters
         # (one count-matrix all_gather + two padded gathers per group instead of
-        # three collectives per parameter).
+        # three collectives per parameter). [Round 8] 32 -> 256: at ~3.4k
+        # entries/rank the steady sync ran ~105 gather rounds, each a world
+        # barrier with a fixed floor (count all_gather + one counts D2H + two
+        # gather launches + rank-0 slicing) that dominated the ~2MB/round blobs
+        # (round 7, raysubmit_wKmFfrWNiRq6wu4a). 256 cuts the round count ~8x;
+        # the count trigger keeps the collective sequence identical across
+        # ranks at any size.
         self.batch_gather = int(batch_gather)
         # [Round 7] Steady flush cap in MB. The transport's bucket_size is sized
         # for the full-model seed streams (GB-class); at a 1-1.5% changed ratio
@@ -310,10 +329,10 @@ class DeltaSyncMixin:
         self.socket.send_string(self.topic, flags=zmq.SNDMORE)
         self.socket.send_pyobj(meta)
         pos_u8 = flush.positions_cpu.to(self._wire_device, non_blocking=True).contiguous().view(torch.uint8)
-        # [Round 7] The steady assemble runs on host (batched export + host
-        # gather return), so the values buffer may need the same one-hop move
-        # to the wire device (no-op when already resident, e.g. the seed
-        # streams and device-resident legacy paths).
+        # [Round 8] The steady gather returns device-resident pieces (see
+        # sparse_gather._gather_ret), so these moves are no-ops on the steady
+        # path; they stay as guards for host-resident sources (the seed streams
+        # and any legacy host path).
         val_src = flush.values_gpu
         if val_src.device != self._wire_device:
             val_src = val_src.to(self._wire_device, non_blocking=True)
@@ -637,6 +656,7 @@ class DeltaSyncMixin:
             return metrics
         weights, _ = engine.get_per_tensor_param_delta_shard()
         t0 = time.time()
+        _t0m = time.monotonic()
         is_r0 = self.is_master
         n_flushes = 0
         changed_elems = 0
@@ -650,15 +670,23 @@ class DeltaSyncMixin:
         # gather = the batched rank-0 collectives; publish = zmq manifest +
         # transport broadcast enqueue (the HCCL engine's per-flush synchronize
         # is inside _broadcast_flush and separately logged there).
+        # [Round 8] first_flush = offset of the first steady flush hitting the
+        # wire (streaming effectiveness; round 7 measured +68s of a 157s send
+        # because the gather return path starved the buckets) and gq_* = the
+        # _GatherQueue's per-phase split (prep = host cat + H2D, coll = the
+        # collectives themselves, consume = rank-0 bucketing).
         t_export = 0.0
         t_gather = 0.0
         t_publish = 0.0
+        t_first_flush = None
         n_entries = 0
 
         def _publish_steady(flush, is_last: bool) -> None:
-            nonlocal n_flushes, t_publish
+            nonlocal n_flushes, t_publish, t_first_flush
             _tp = time.monotonic()
             self._publish_flush(flush, first=False, is_last=is_last)
+            if t_first_flush is None:
+                t_first_flush = time.monotonic() - _t0m
             t_publish += time.monotonic() - _tp
             n_flushes += 1
 
@@ -734,7 +762,8 @@ class DeltaSyncMixin:
         ratio = (changed_elems / total_elems) if total_elems else 0.0
         logger.info(
             "delta-sharded send v=%s done in %.1fs (delta flushes=%d changed_ratio=%.4f wire=%.1fMB) "
-            "[TIMING-TX export=%.1fs gather=%.1fs publish=%.1fs entries=%d] wall=%.3f",
+            "[TIMING-TX export=%.1fs gather=%.1fs publish=%.1fs entries=%d first_flush=%.1fs "
+            "gq_rounds=%d gq_prep=%.1fs gq_coll=%.1fs gq_consume=%.1fs] wall=%.3f",
             global_steps,
             elapsed,
             n_flushes,
@@ -744,6 +773,11 @@ class DeltaSyncMixin:
             t_gather,
             t_publish,
             n_entries,
+            -1.0 if t_first_flush is None else t_first_flush,
+            gq.stats["rounds"],
+            gq.stats["prep"],
+            gq.stats["coll"],
+            gq.stats["consume"],
             time.time(),
         )
         if not total_elems or not changed_elems:

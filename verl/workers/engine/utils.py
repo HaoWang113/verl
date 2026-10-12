@@ -308,7 +308,12 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
     host memory (one async D2H per param, ONE stream sync per batch), then diff
     and probe each param on host tensors and yield the same entry tuples as the
     legacy path (idx/val host-resident; the gather moves them to the wire device
-    in batch)."""
+    in batch).
+
+    [Round 8] Per-phase timers (gen/stage/diff/snap/entry) logged in
+    [TIMING-EXPORT]: round 7 (raysubmit_wKmFfrWNiRq6wu4a) left the steady
+    export at 33.6s with no split, so the next optimization target inside it
+    (probe vs staging vs diff) could not be told apart from the logs."""
     from .spec import derive_dtensor_placement
 
     t_start = time.monotonic()
@@ -316,9 +321,14 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
     n_changed = 0
     n_batches = 0
     batch: list = []
+    t_gen = 0.0
+    t_stage = 0.0
+    t_diff = 0.0
+    t_snap = 0.0
+    t_entry = 0.0
 
     def _flush_batch():
-        nonlocal n_batches, n_changed
+        nonlocal n_batches, n_changed, t_stage, t_diff, t_snap, t_entry
         n_batches += 1
         # (a) stage device-resident params into one host arena; ONE sync per batch.
         staged: dict[int, torch.Tensor] = {}
@@ -330,6 +340,7 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
                 total += local.numel() * local.element_size()
                 dev_type = local.device.type
         if total:
+            _ts = time.monotonic()
             arena = _staging_arena(total)
             offset = 0
             for i, (name, local, spec, place, contributes, pg, snap) in enumerate(batch):
@@ -342,24 +353,40 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
                 staged[i] = seg
                 offset += local.numel() * es
             getattr(torch, dev_type).current_stream().synchronize()
+            t_stage += time.monotonic() - _ts
         # (b) host diff + probe + entry per param; host nonzero has no device sync.
         try:
             for i, (name, local, spec, place, contributes, pg, snap) in enumerate(batch):
                 newflat = staged.get(i, local)
                 if contributes:
+                    _td = time.monotonic()
                     lidx, lval = _cpu_shard_diff(newflat, snap)
+                    t_diff += time.monotonic() - _td
                     n_changed += int(lidx.numel())
                 else:
                     # replicated param owned by another rank; empty delta keeps lockstep.
                     lidx = torch.empty(0, dtype=torch.int64)
                     lval = torch.empty(0, dtype=local.dtype)
+                _tn = time.monotonic()
                 snap.copy_(newflat)
-                yield (*entry_fn(name, spec, place, lidx, lval), pg)
+                t_snap += time.monotonic() - _tn
+                _te = time.monotonic()
+                entry = entry_fn(name, spec, place, lidx, lval)
+                t_entry += time.monotonic() - _te
+                yield (*entry, pg)
         finally:
             staged.clear()
 
     batch_bytes = 0
-    for name, local, spec in gen:
+    _gen_iter = iter(gen)
+    while True:
+        _tg = time.monotonic()
+        try:
+            name, local, spec = next(_gen_iter)
+        except StopIteration:
+            t_gen += time.monotonic() - _tg
+            break
+        t_gen += time.monotonic() - _tg
         local = local.detach().contiguous().view(-1)
         snap = snaps.get(name)
         assert snap is not None and snap.numel() == local.numel(), (
@@ -381,12 +408,18 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
     if batch:
         yield from _flush_batch()
     logger.warning(
-        "[TIMING-EXPORT] batched host export done: params=%d changed=%d batches=%d pinned=%s elapsed=%.1fs",
+        "[TIMING-EXPORT] batched host export done: params=%d changed=%d batches=%d pinned=%s elapsed=%.1fs "
+        "(gen=%.1fs stage=%.1fs diff=%.1fs snap=%.1fs entry=%.1fs)",
         n_params,
         n_changed,
         n_batches,
         _STAGING_PINNED,
         time.monotonic() - t_start,
+        t_gen,
+        t_stage,
+        t_diff,
+        t_snap,
+        t_entry,
     )
 
 
