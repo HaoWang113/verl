@@ -53,14 +53,38 @@ from __future__ import annotations
 import copy
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from verl.workers.engine.spec import ShardSpec
 
 logger = logging.getLogger(__name__)
+
+# [Round 9] Bit-level NaN sentinel kit. The probe fills a full-slot buffer with
+# NaN, runs the real transform, then scans each output slot for survivors.
+# Round 8 (raysubmit_X97dLkpbq5HKdaD9) measured entry=12.5-17.8s/rank on the
+# aarch64 torch CPU paths (torch.full / ~isnan / nonzero on bf16 are
+# unvectorized there). The numpy int-view fill+scan below are NEON-vectorized
+# and bit-exact with torch's NaN semantics for every IEEE float: NaN <=> exponent
+# all-ones AND mantissa nonzero (so inf is NOT NaN; sign is ignored -- both
+# quiet and signaling NaNs, either sign, count as filler, a superset of the
+# quiet-NaN bits we fill with, exactly like torch.isnan). Host tensors only;
+# device tensors keep the torch paths.
+_NAN_BITS: dict = {
+    torch.bfloat16: (torch.int16, 0x7FC0, 0x7F80, 0x007F),
+    torch.float16: (torch.int16, 0x7E00, 0x7C00, 0x03FF),
+    torch.float32: (torch.int32, 0x7FC00000, 0x7F800000, 0x007FFFFF),
+    torch.float64: (torch.int64, 0x7FF8000000000000, 0x7FF0000000000000, 0x000FFFFFFFFFFFFF),
+}
+
+# Per-sync cost split of mcore_hf_delta_entry (fill = NaN buffer build, xf =
+# the real megatron_to_hf transform, scan = survivor extraction), read by
+# engine/utils' [TIMING-EXPORT] line and reset there.
+ENTRY_TIMING = {"fill": 0.0, "xf": 0.0, "scan": 0.0}
 
 # Id-less fused MoE HF names (e.g. qwen3_5's fused checkpoint format
 # '...mlp.experts.gate_up_proj'): legitimate for whole-layer 3D slots on the
@@ -519,11 +543,20 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
             torch.empty(0, dtype=lval.dtype, device=lval.device),
         )
 
-    buf = torch.full(tuple(rec.param.shape), float("nan"), dtype=lval.dtype, device=lval.device)
+    _tf = time.monotonic()
+    nanbits = _NAN_BITS.get(lval.dtype) if lval.device.type == "cpu" else None
+    if nanbits is not None:
+        buf = torch.empty(tuple(rec.param.shape), dtype=lval.dtype, device=lval.device)
+        buf.view(nanbits[0]).numpy().fill(nanbits[1])
+    else:
+        buf = torch.full(tuple(rec.param.shape), float("nan"), dtype=lval.dtype, device=lval.device)
     if lidx.numel():
         buf.view(-1)[lidx] = lval
+    ENTRY_TIMING["fill"] += time.monotonic() - _tf
 
+    _txf = time.monotonic()
     outs = rec.probe.megatron_to_hf(buf, rec.module)
+    ENTRY_TIMING["xf"] += time.monotonic() - _txf
 
     if rec.expert_gid is not None:
         # Fused-name expert row (qwen3_5's FusedGatedExpertMapping): re-key the
@@ -571,11 +604,21 @@ def mcore_hf_delta_entry(rec: McoreParamExport, _place, lidx: torch.Tensor, lval
         if out is None:
             continue  # another rank's slot (e.g. its ep-local experts): zero count here
         fl = out.reshape(-1)
-        p_ = (~torch.isnan(fl)).nonzero(as_tuple=False).view(-1)
+        _tscan = time.monotonic()
+        if nanbits is not None and fl.device.type == "cpu":
+            # [Round 9] NEON-vectorized survivor scan: not-NaN <=> NOT(exp
+            # all-ones AND mantissa nonzero), bit-exact with ~torch.isnan.
+            nu = fl.contiguous().view(nanbits[0]).numpy()
+            _, _, exp_m, man_m = nanbits
+            survivor = np.flatnonzero(~(((nu & exp_m) == exp_m) & ((nu & man_m) != 0)))
+            p_ = torch.from_numpy(survivor)
+        else:
+            p_ = (~torch.isnan(fl)).nonzero(as_tuple=False).view(-1)
         if p_.numel():
             counts[s_i] = p_.numel()
             idx_pieces.append(p_.to(torch.int32))
             val_pieces.append(fl[p_])
+        ENTRY_TIMING["scan"] += time.monotonic() - _tscan
     if idx_pieces:
         hf_idx = torch.cat(idx_pieces)
         hf_val = torch.cat(val_pieces)

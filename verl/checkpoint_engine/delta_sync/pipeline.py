@@ -35,16 +35,19 @@ Data ladder (sender side, steady) -- names anchor the pieces in this module::
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import zmq
 
 from .encode import DeltaFlush, DeltaParam
 from .encode import checksum as _checksum
-from .sparse_gather import gather_slot_entries_to_rank0
+from .sparse_gather import _pg_torch_device, gather_slot_entries_to_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +173,21 @@ class _GatherQueue:
         # time from the host prep and the bucketing, which round 7's single
         # t_gather number could not (the 116-135s it showed was dominated by the
         # since-removed per-slot .cpu() return path, not the wire).
-        self.stats = {"rounds": 0, "prep": 0.0, "coll": 0.0, "consume": 0.0}
+        # [Round 9] "counts"/"payload" (filled by gather_slot_entries_to_rank0)
+        # split the collective time further: counts = the 2KB count-matrix
+        # all_gather (arrival skew + launch), payload = the padded gathers
+        # (wire + dist.gather implementation); "pad_bytes"/"useful_bytes" expose
+        # the max_n padding amplification (see sparse_gather [Round 9]).
+        self.stats = {
+            "rounds": 0,
+            "prep": 0.0,
+            "coll": 0.0,
+            "consume": 0.0,
+            "counts": 0.0,
+            "payload": 0.0,
+            "pad_bytes": 0,
+            "useful_bytes": 0,
+        }
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
         _pg, entries = self._queues.setdefault(id(pg), (pg, []))
@@ -205,12 +222,28 @@ class _GatherQueue:
         idx_concat = torch.cat([i for _, _, _, i, _ in batch])
         val_concat = torch.cat([v for _, _, _, _, v in batch])
         _tc = time.monotonic()
+        _s0 = (self.stats["counts"], self.stats["payload"], self.stats["pad_bytes"], self.stats["useful_bytes"])
         gathered = gather_slot_entries_to_rank0(
-            idx_concat, val_concat, counts_concat, group=pg, max_round_bytes=self.max_round_bytes
+            idx_concat, val_concat, counts_concat, group=pg, max_round_bytes=self.max_round_bytes, stats=self.stats
         )
         self.stats["rounds"] += 1
         self.stats["prep"] += _tc - _tp
-        self.stats["coll"] += time.monotonic() - _tc
+        t_coll = time.monotonic() - _tc
+        self.stats["coll"] += t_coll
+        if self.is_r0:
+            # [Round 9] per-round split on rank 0: rounds fire every batch_k
+            # entries and each is a world barrier, so a slow round here is either
+            # waiting for a slow producer (shows in "counts") or moving/copying
+            # payload (shows in "payload" + pad/useful bytes).
+            logger.info(
+                "[GQ-ROUND] k=%d useful=%.1fMB pad=%.1fMB t_coll=%.2fs (counts=%.2fs payload=%.2fs)",
+                len(batch),
+                (self.stats["useful_bytes"] - _s0[3]) / (1 << 20),
+                (self.stats["pad_bytes"] - _s0[2]) / (1 << 20),
+                t_coll,
+                self.stats["counts"] - _s0[0],
+                self.stats["payload"] - _s0[1],
+            )
         _tu = time.monotonic()
         if self.is_r0 and gathered is not None:
             slot_i = 0
@@ -675,6 +708,13 @@ class DeltaSyncMixin:
         # because the gather return path starved the buckets) and gq_* = the
         # _GatherQueue's per-phase split (prep = host cat + H2D, coll = the
         # collectives themselves, consume = rank-0 bucketing).
+        # [Round 9] export now runs on the producer thread: t_export = queue-get
+        # wait (production gating the send), t_gather = batching + collectives;
+        # the two overlap, so export+gather no longer sum to the wall. gq_counts
+        # (count-matrix all_gather: arrival skew + launch) vs gq_payload (padded
+        # gathers: wire/impl) and pad MB (max_n amplification of the useful
+        # payload) split gq_coll; probe_ag/probe_g = the one-shot 8MB/rank
+        # all_gather/gather bandwidth probe on the busiest group.
         t_export = 0.0
         t_gather = 0.0
         t_publish = 0.0
@@ -718,26 +758,100 @@ class DeltaSyncMixin:
         # ``weights`` is the BACKEND's HF delta stream (hf_delta_export): entries
         # already carry final HF coordinates -- naming, conversion, diff and
         # snapshot all happened on the backend side. This engine only batches,
-        # gathers and ships. The next()/put() split keeps the backend's lazy
-        # per-param work (diff, probe, nonzero) in t_export and the batching +
-        # collectives in t_gather (see [TIMING-TX] above).
-        _entries = iter(weights)
-        while True:
-            _te = time.monotonic()
+        # gathers and ships.
+        # [Round 9] producer/consumer split: round 8 (raysubmit_X97dLkpbq5HKdaD9)
+        # added up export=32.7s + gather=83.9s almost serially (send 123.9s)
+        # because every gather round is a world barrier that froze the
+        # single-threaded generator mid-walk, and the barrier's wait for the
+        # slowest producer landed inside gq_coll. The backend export (staging
+        # D2H + diff + probe -- NO collectives: the probe's comm helpers are
+        # local synthesis) now runs on a daemon thread feeding a bounded queue,
+        # so production runs ahead during rounds and the queue bound (~128
+        # entries) caps host memory. t_export below = queue-get wait (i.e. the
+        # production time still gating the send); t_gather = batching +
+        # collectives, now the only main-thread blocking work.
+        entry_q: queue.Queue = queue.Queue(maxsize=128)
+        _cancel = threading.Event()
+
+        def _produce() -> None:
             try:
-                entry = next(_entries)
-            except StopIteration:
+                for entry in weights:
+                    if _cancel.is_set():
+                        return
+                    entry_q.put(entry)
+                entry_q.put(None)
+            except BaseException as e:  # noqa: BLE001 - re-raised on the consumer side, fail loud
+                entry_q.put(e)
+
+        _producer = threading.Thread(target=_produce, name="delta-export", daemon=True)
+        _producer.start()
+        probe_pg = None
+        try:
+            while True:
+                _te = time.monotonic()
+                entry = entry_q.get()
                 t_export += time.monotonic() - _te
-                break
-            t_export += time.monotonic() - _te
+                if entry is None:
+                    break
+                if isinstance(entry, BaseException):
+                    raise entry
+                _tg = time.monotonic()
+                slots, dtype_str, counts, hf_idx, hf_val, pg = entry
+                gq.put(pg, slots, dtype_str, counts, hf_idx, hf_val)
+                t_gather += time.monotonic() - _tg
+                n_entries += 1
+                if probe_pg is None and pg is not None and dist.get_world_size(pg) >= 16:
+                    # [Round 9] the busiest gather group (the >=16 filter picks
+                    # the expert/world group over small fsdp TP groups); every
+                    # rank sees the same entry sequence, so the choice is
+                    # cluster-consistent.
+                    probe_pg = pg
             _tg = time.monotonic()
-            slots, dtype_str, counts, hf_idx, hf_val, pg = entry
-            gq.put(pg, slots, dtype_str, counts, hf_idx, hf_val)
+            gq.flush_all()
             t_gather += time.monotonic() - _tg
-            n_entries += 1
-        _tg = time.monotonic()
-        gq.flush_all()
-        t_gather += time.monotonic() - _tg
+        finally:
+            # Consumer-side failure must not leak a producer blocked on a full
+            # queue: flip the cancel flag and drain until the thread exits.
+            _cancel.set()
+            while _producer.is_alive():
+                try:
+                    entry_q.get_nowait()
+                except queue.Empty:
+                    time.sleep(0.005)
+
+        if probe_pg is not None:
+            # [Round 9] one-shot bandwidth probe on the busiest gather group, to
+            # separate "dist.gather is slow on HCCL" from "the fabric is slow":
+            # the same 8MB/rank payload through all_gather (FSDP's hot path) and
+            # through gather. All ranks reach here deterministically (the rounds
+            # just completed in lockstep); ~1s total, once per steady sync.
+            _pw = dist.get_world_size(probe_pg)
+            _pr = dist.get_rank(probe_pg)
+            _pdev = _pg_torch_device(probe_pg)
+            _x = torch.ones(1 << 21, dtype=torch.float32, device=_pdev)  # 2M float32 = 8MB
+            # all_gather needs its output list on EVERY rank (pw x 8MB = 256MB
+            # transient); gather's gather_list is rank-0-only.
+            _outs = [torch.empty_like(_x) for _ in range(_pw)]
+            _t1 = time.monotonic()
+            dist.all_gather(_outs, _x, group=probe_pg)
+            t_probe_ag = time.monotonic() - _t1
+            _gouts = _outs if _pr == 0 else None
+            _t2 = time.monotonic()
+            dist.gather(_x, _gouts, dst=dist.get_global_rank(probe_pg, 0), group=probe_pg)
+            t_probe_g = time.monotonic() - _t2
+            del _outs, _gouts
+            if _pr == 0:
+                logger.info(
+                    "[FABRIC-PROBE] world=%d allgather_8MB=%.2fs (%.0fMB/s) gather_8MB=%.2fs (%.0fMB/s)",
+                    _pw,
+                    t_probe_ag,
+                    _pw * 8 / max(t_probe_ag, 1e-6),
+                    t_probe_g,
+                    _pw * 8 / max(t_probe_g, 1e-6),
+                )
+        else:
+            t_probe_ag = -1.0
+            t_probe_g = -1.0
 
         # For SGLang, verify_every=K appends a dense state-verification sweep to
         # every K-th steady sync inside the same receive stream. The steady bucket
@@ -763,7 +877,8 @@ class DeltaSyncMixin:
         logger.info(
             "delta-sharded send v=%s done in %.1fs (delta flushes=%d changed_ratio=%.4f wire=%.1fMB) "
             "[TIMING-TX export=%.1fs gather=%.1fs publish=%.1fs entries=%d first_flush=%.1fs "
-            "gq_rounds=%d gq_prep=%.1fs gq_coll=%.1fs gq_consume=%.1fs] wall=%.3f",
+            "gq_rounds=%d gq_prep=%.1fs gq_coll=%.1fs gq_consume=%.1fs "
+            "gq_counts=%.1fs gq_payload=%.1fs pad=%.0fMB probe_ag=%.2fs probe_g=%.2fs] wall=%.3f",
             global_steps,
             elapsed,
             n_flushes,
@@ -778,6 +893,11 @@ class DeltaSyncMixin:
             gq.stats["prep"],
             gq.stats["coll"],
             gq.stats["consume"],
+            gq.stats["counts"],
+            gq.stats["payload"],
+            gq.stats["pad_bytes"] / (1 << 20),
+            t_probe_ag,
+            t_probe_g,
             time.time(),
         )
         if not total_elems or not changed_elems:

@@ -27,6 +27,7 @@ Other shard dims are strided in the flattened layout and raise NotImplementedErr
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -83,6 +84,7 @@ def gather_slot_entries_to_rank0(
     counts: torch.Tensor,
     group: dist.ProcessGroup | None = None,
     max_round_bytes: int | None = None,
+    stats: dict | None = None,
 ) -> list | None:
     """Variable-length sparse gather, batched: one collective round for K parameters.
 
@@ -102,6 +104,14 @@ def gather_slot_entries_to_rank0(
     raysubmit_wKmFfrWNiRq6wu4a: gather 116-135s, flat in the changed ratio),
     i.e. the per-param device-sync disease this module was built to avoid,
     reintroduced on the return path.
+    [Round 9] Optional ``stats`` accumulator (threaded through sub-rounds) splits
+    the round time: "counts" = the count-matrix all_gather (a 2KB-class world
+    barrier whose time is arrival skew + launch, not wire) vs "payload" = the two
+    padded gathers (wire + gather-implementation cost); "pad_bytes"/"useful_bytes"
+    expose the max_n padding amplification. Round 8 (raysubmit_X97dLkpbq5HKdaD9)
+    left gq_coll=81.9s for ~1.7GB of useful payload (~21MB/s aggregate, vs
+    1.35GB/s for the dense broadcast on the same cluster) -- these counters
+    tell skew from wire from padding without another blind fix round.
     """
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
@@ -117,7 +127,10 @@ def gather_slot_entries_to_rank0(
     k = int(counts.numel())
 
     counts_all = [torch.zeros_like(counts) for _ in range(world)]
+    _tcounts = time.monotonic()
     dist.all_gather(counts_all, counts.to(dev), group=group)
+    if stats is not None:
+        stats["counts"] += time.monotonic() - _tcounts
     counts_cpu = torch.stack(counts_all).cpu().tolist()  # one D2H sync instead of `world`
 
     if max_round_bytes is not None and k > 1:
@@ -146,6 +159,7 @@ def gather_slot_entries_to_rank0(
                     val_concat[my_off[lo] : my_off[hi]],
                     sub_counts,
                     group=group,
+                    stats=stats,
                 )
                 if rank == 0:
                     out_all.extend(sub)
@@ -167,9 +181,15 @@ def gather_slot_entries_to_rank0(
     val_pad[:n] = val_concat
 
     idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    val_list = [torch.zeros(max_n, dtype=val_concat.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+    val_list = [torch.zeros(max_n, dtype=val_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+    _tpayload = time.monotonic()
     dist.gather(idx_pad, idx_list, dst=dst, group=group)
     dist.gather(val_pad, val_list, dst=dst, group=group)
+    if stats is not None:
+        stats["payload"] += time.monotonic() - _tpayload
+        per_elem = idx_pad.element_size() + val_pad.element_size()
+        stats["pad_bytes"] += world * max_n * per_elem
+        stats["useful_bytes"] += sum(totals) * per_elem
     if rank != 0:
         return None
 

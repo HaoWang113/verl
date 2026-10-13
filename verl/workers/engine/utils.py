@@ -288,7 +288,14 @@ def _cpu_shard_diff(newflat: torch.Tensor, snap: torch.Tensor) -> tuple[torch.Te
 
     Same contract as :func:`verl.checkpoint_engine.delta_sync.sparse_gather.\
     shard_delta_indices` (bytewise, dtype-agnostic, no arithmetic) but on host
-    tensors, where the nonzero needs no device sync."""
+    tensors, where the nonzero needs no device sync.
+
+    [Round 9] numpy bit-level compare + ``flatnonzero``: round 8
+    (raysubmit_X97dLkpbq5HKdaD9) measured diff=11-12s per rank over ~2.2GB of
+    staged shards (~360MB/s) on the aarch64 torch CPU int-view paths; the numpy
+    int-view ufunc + flatnonzero are NEON-vectorized. ``.numpy()`` on the
+    int-view is zero-copy (same storage), and flatnonzero yields int64 exactly
+    like torch's nonzero."""
     from verl.checkpoint_engine.delta_sync.sparse_gather import _DTYPE_INT
 
     if newflat.dtype != snap.dtype:
@@ -296,8 +303,8 @@ def _cpu_shard_diff(newflat: torch.Tensor, snap: torch.Tensor) -> tuple[torch.Te
     int_dtype = _DTYPE_INT.get(newflat.element_size())
     if int_dtype is None:
         raise ValueError(f"unsupported element size {newflat.element_size()}")
-    mask = newflat.view(int_dtype) != snap.view(int_dtype)
-    lidx = mask.nonzero(as_tuple=False).view(-1)
+    neq = newflat.view(int_dtype).numpy() != snap.view(int_dtype).numpy()
+    lidx = torch.from_numpy(np.flatnonzero(neq))
     if lidx.numel():
         return lidx, newflat.index_select(0, lidx)
     return lidx, torch.empty(0, dtype=newflat.dtype)
@@ -407,9 +414,20 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
             batch_bytes = 0
     if batch:
         yield from _flush_batch()
+    # [Round 9] the mcore entry builder splits its cost into fill/xf/scan (see
+    # delta_export.ENTRY_TIMING); append it when the backend provides it, then
+    # reset for the next sync. Absent for other backends / legacy paths.
+    entry_split = ""
+    try:
+        from .megatron.delta_export import ENTRY_TIMING as _et
+
+        entry_split = f" (entry: fill={_et['fill']:.1fs} xf={_et['xf']:.1fs} scan={_et['scan']:.1fs})"
+        _et.update(fill=0.0, xf=0.0, scan=0.0)
+    except Exception:
+        pass
     logger.warning(
         "[TIMING-EXPORT] batched host export done: params=%d changed=%d batches=%d pinned=%s elapsed=%.1fs "
-        "(gen=%.1fs stage=%.1fs diff=%.1fs snap=%.1fs entry=%.1fs)",
+        "(gen=%.1fs stage=%.1fs diff=%.1fs snap=%.1fs entry=%.1fs%s)",
         n_params,
         n_changed,
         n_batches,
@@ -420,6 +438,7 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
         t_diff,
         t_snap,
         t_entry,
+        entry_split,
     )
 
 
