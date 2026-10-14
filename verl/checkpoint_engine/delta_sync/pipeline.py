@@ -178,6 +178,10 @@ class _GatherQueue:
         # all_gather (arrival skew + launch), payload = the padded gathers
         # (wire + dist.gather implementation); "pad_bytes"/"useful_bytes" expose
         # the max_n padding amplification (see sparse_gather [Round 9]).
+        # [Round 10] "a2a_rounds" counts the rounds that moved payload with
+        # exact-size all_to_all_single (R9 verdict: 8811MB pad vs 1956MB useful
+        # at line rate -- structural ownership skew, so the fix is exact sizes,
+        # not round sizing).
         self.stats = {
             "rounds": 0,
             "prep": 0.0,
@@ -187,6 +191,7 @@ class _GatherQueue:
             "payload": 0.0,
             "pad_bytes": 0,
             "useful_bytes": 0,
+            "a2a_rounds": 0,
         }
 
     def put(self, pg, slots: list, dtype_str: str, counts: torch.Tensor, idx: torch.Tensor, val: torch.Tensor):
@@ -715,6 +720,9 @@ class DeltaSyncMixin:
         # gathers: wire/impl) and pad MB (max_n amplification of the useful
         # payload) split gq_coll; probe_ag/probe_g = the one-shot 8MB/rank
         # all_gather/gather bandwidth probe on the busiest group.
+        # [Round 10] gq_a2a = rounds moved by exact-size all_to_all_single
+        # (pad MB ~0 confirms it); probe_a2a = the same 8MB/rank pattern
+        # through all_to_all for an apples-to-apples line-rate check.
         t_export = 0.0
         t_gather = 0.0
         t_publish = 0.0
@@ -840,18 +848,39 @@ class DeltaSyncMixin:
             dist.gather(_x, _gouts, dst=dist.get_global_rank(probe_pg, 0), group=probe_pg)
             t_probe_g = time.monotonic() - _t2
             del _outs, _gouts
+            # [Round 10] same 8MB/rank -> rank 0 pattern through the exact-size
+            # all_to_all the payload rounds now use: apples-to-apples with
+            # gather_8MB (if a2a is broken here this raises like the mode probe
+            # did and logs -1, which is itself a diagnosis).
+            t_probe_a2a = -1.0
+            try:
+                _ai = [0] * _pw
+                _ai[0] = 1 << 21
+                _ao = [1 << 21] * _pw if _pr == 0 else [0] * _pw
+                _arecv = torch.empty(sum(_ao), dtype=torch.float32, device=_pdev)
+                _t3 = time.monotonic()
+                dist.all_to_all_single(_arecv, _x, output_split_sizes=_ao, input_split_sizes=_ai, group=probe_pg)
+                t_probe_a2a = time.monotonic() - _t3
+                del _arecv
+            except Exception:
+                t_probe_a2a = -1.0
             if _pr == 0:
+                _a2a_mb = _pw * 8 / t_probe_a2a if t_probe_a2a > 0 else -1.0
                 logger.info(
-                    "[FABRIC-PROBE] world=%d allgather_8MB=%.2fs (%.0fMB/s) gather_8MB=%.2fs (%.0fMB/s)",
+                    "[FABRIC-PROBE] world=%d allgather_8MB=%.2fs (%.0fMB/s) gather_8MB=%.2fs (%.0fMB/s) "
+                    "a2a_8MB=%.2fs (%.0fMB/s)",
                     _pw,
                     t_probe_ag,
                     _pw * 8 / max(t_probe_ag, 1e-6),
                     t_probe_g,
                     _pw * 8 / max(t_probe_g, 1e-6),
+                    t_probe_a2a,
+                    _a2a_mb,
                 )
         else:
             t_probe_ag = -1.0
             t_probe_g = -1.0
+            t_probe_a2a = -1.0
 
         # For SGLang, verify_every=K appends a dense state-verification sweep to
         # every K-th steady sync inside the same receive stream. The steady bucket
@@ -877,8 +906,8 @@ class DeltaSyncMixin:
         logger.info(
             "delta-sharded send v=%s done in %.1fs (delta flushes=%d changed_ratio=%.4f wire=%.1fMB) "
             "[TIMING-TX export=%.1fs gather=%.1fs publish=%.1fs entries=%d first_flush=%.1fs "
-            "gq_rounds=%d gq_prep=%.1fs gq_coll=%.1fs gq_consume=%.1fs "
-            "gq_counts=%.1fs gq_payload=%.1fs pad=%.0fMB probe_ag=%.2fs probe_g=%.2fs] wall=%.3f",
+            "gq_rounds=%d gq_a2a=%d gq_prep=%.1fs gq_coll=%.1fs gq_consume=%.1fs "
+            "gq_counts=%.1fs gq_payload=%.1fs pad=%.0fMB probe_ag=%.2fs probe_g=%.2fs probe_a2a=%.2fs] wall=%.3f",
             global_steps,
             elapsed,
             n_flushes,
@@ -890,6 +919,7 @@ class DeltaSyncMixin:
             n_entries,
             -1.0 if t_first_flush is None else t_first_flush,
             gq.stats["rounds"],
+            gq.stats["a2a_rounds"],
             gq.stats["prep"],
             gq.stats["coll"],
             gq.stats["consume"],
@@ -898,6 +928,7 @@ class DeltaSyncMixin:
             gq.stats["pad_bytes"] / (1 << 20),
             t_probe_ag,
             t_probe_g,
+            t_probe_a2a,
             time.time(),
         )
         if not total_elems or not changed_elems:

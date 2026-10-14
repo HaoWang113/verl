@@ -27,6 +27,8 @@ Other shard dims are strided in the flattened layout and raise NotImplementedErr
 
 from __future__ import annotations
 
+import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -36,7 +38,16 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     pass
 
+logger = logging.getLogger(__name__)
+
 _DTYPE_INT = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+# [Round 10] payload transport mode. "a2a" (default) moves each rank's exact
+# totals[rank] elements with all_to_all_single (no max_n padding); "gather"
+# (VERL_DELTA_GATHER_MODE=gather) forces the legacy padded dist.gather. The
+# choice is made once per group, identically on every rank (see _decide_a2a).
+_A2A_MODE: dict = {}
+_GATHER_MODE_ENV = os.environ.get("VERL_DELTA_GATHER_MODE", "a2a").strip().lower()
 
 
 def shard_delta_indices(
@@ -78,6 +89,55 @@ def _pg_torch_device(group) -> torch.device:
     return torch.device("cpu")
 
 
+def _decide_a2a(group, world: int) -> str:
+    """Decide ONCE per group, identically on every rank, whether the payload
+    move uses exact-size ``all_to_all_single`` ("a2a") or the legacy padded
+    ``dist.gather`` ("gather").
+
+    [Round 10] R9 proved the padded gathers already run at line rate (~175MB/s
+    sustained, matching the 146MB/s one-shot probe) but move 5.5x the useful
+    bytes: 8811MB of max_n padding vs 1956MB useful. The padding is
+    STRUCTURAL, not a batching artifact: MoE slot ownership is 1-of-world per
+    slot, so max_n / avg(totals) stays ~4.5 in every window and the sub-round
+    cuts (identical on every rank) cannot change the ratio. all_to_all_single
+    with exact per-pair sizes moves only the useful bytes and is the standard
+    unequal-split collective on this stack (vllm-ascend's MoE token dispatch).
+    The probe below exercises empty send AND empty receive splits; the MIN
+    all_reduce keeps the choice identical across ranks -- a per-rank fallback
+    would desync the collectives and deadlock. gloo (unit tests) does not
+    implement all_to_all and downgrades everyone to "gather".
+    """
+    key = id(group)
+    mode = _A2A_MODE.get(key)
+    if mode is not None:
+        return mode
+    mode = "a2a" if _GATHER_MODE_ENV != "gather" else "gather"
+    if mode == "a2a":
+        dev = _pg_torch_device(group)
+        ok = torch.ones(1, dtype=torch.int32, device=dev)
+        try:
+            r = dist.get_rank(group)
+            # rank 0 sends nothing and receives 1 int from every other rank;
+            # ranks > 0 send 1 int and receive nothing.
+            n = 0 if r == 0 else 1
+            send = torch.arange(n, dtype=torch.int32, device=dev)
+            in_split = [0] * world
+            in_split[0] = n
+            out_split = [0] * world if r != 0 else [0] + [1] * (world - 1)
+            recv = torch.empty(sum(out_split), dtype=torch.int32, device=dev)
+            dist.all_to_all_single(recv, send, output_split_sizes=out_split, input_split_sizes=in_split, group=group)
+        except Exception as e:  # noqa: BLE001 - downgrade, not crash: gather still works
+            logger.warning("[GQ-A2A] all_to_all_single unusable (world=%d): %r; using padded gather", world, e)
+            ok.zero_()
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if int(ok.item()) == 0:
+            mode = "gather"
+        if dist.get_rank(group) == 0:
+            logger.info("[GQ-A2A] payload transport mode=%s (world=%d)", mode, world)
+    _A2A_MODE[key] = mode
+    return mode
+
+
 def gather_slot_entries_to_rank0(
     idx_concat: torch.Tensor,
     val_concat: torch.Tensor,
@@ -90,8 +150,9 @@ def gather_slot_entries_to_rank0(
 
     Each rank passes its K per-parameter deltas concatenated (``idx_concat``,
     ``val_concat``) plus the per-parameter length vector ``counts`` ([K] int64).
-    One all_gather exchanges the K x world count matrix; two padded gathers move
-    the blobs. Rank 0 slices per (rank, param) and returns K ``(idx, val)`` pairs
+    One all_gather exchanges the K x world count matrix; the payloads then move
+    to rank 0 (exact-size all_to_all_single by default, padded gathers as the
+    fallback). Rank 0 slices per (rank, param) and returns K ``(idx, val)`` pairs
     (None elsewhere) -- bit-identical to K individual gathers, ~K x fewer
     collectives and host syncs.
 
@@ -112,6 +173,10 @@ def gather_slot_entries_to_rank0(
     left gq_coll=81.9s for ~1.7GB of useful payload (~21MB/s aggregate, vs
     1.35GB/s for the dense broadcast on the same cluster) -- these counters
     tell skew from wire from padding without another blind fix round.
+    [Round 10] the verdict was PADDING (8811MB pad vs 1956MB useful at a
+    ~175MB/s line; counts rounds were ~0.01s): the payload move now defaults
+    to exact-size all_to_all_single (see _decide_a2a) -- pad_bytes stays 0 in
+    a2a mode, and stats["a2a_rounds"] counts the rounds that used it.
     """
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)
@@ -174,24 +239,65 @@ def gather_slot_entries_to_rank0(
         empty_v = torch.empty(0, dtype=val_concat.dtype, device=dev)
         return _gather_ret([(empty_i, empty_v) for _ in range(k)], rank)
 
-    idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
-    val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
-    n = int(idx_concat.numel())
-    idx_pad[:n] = idx_concat
-    val_pad[:n] = val_concat
+    if _decide_a2a(group, world) == "a2a":
+        # [Round 10] exact-size move: every rank sends only its own
+        # totals[rank] elements to group rank 0 (empty split to the rest);
+        # rank 0 receives the world's blobs concatenated in group-rank order
+        # -- the same layout the padded gathers produced, minus the zeros, so
+        # the per-slot slicing below is unchanged. Moves sum(totals) bytes
+        # instead of world * max_n (R9: 1956MB useful vs 8811MB pad on one
+        # ~175MB/s line = 60.7s of payload for ~12s of useful bytes).
+        n = int(idx_concat.numel())
+        in_split = [0] * world
+        in_split[0] = n
+        if rank == 0:
+            out_split = [int(t) for t in totals]
+            idx_out = torch.empty(sum(out_split), dtype=idx_concat.dtype, device=dev)
+            val_out = torch.empty(sum(out_split), dtype=val_concat.dtype, device=dev)
+        else:
+            out_split = [0] * world
+            idx_out = torch.empty(0, dtype=idx_concat.dtype, device=dev)
+            val_out = torch.empty(0, dtype=val_concat.dtype, device=dev)
+        _tpayload = time.monotonic()
+        dist.all_to_all_single(
+            idx_out, idx_concat, output_split_sizes=out_split, input_split_sizes=in_split, group=group
+        )
+        dist.all_to_all_single(
+            val_out, val_concat, output_split_sizes=out_split, input_split_sizes=in_split, group=group
+        )
+        if stats is not None:
+            stats["payload"] += time.monotonic() - _tpayload
+            per_elem = idx_concat.element_size() + val_concat.element_size()
+            stats["useful_bytes"] += sum(totals) * per_elem
+            stats["a2a_rounds"] = stats.get("a2a_rounds", 0) + 1
+        if rank != 0:
+            return None
+        idx_list = []
+        val_list = []
+        off = 0
+        for t in totals:
+            idx_list.append(idx_out[off : off + t])
+            val_list.append(val_out[off : off + t])
+            off += int(t)
+    else:
+        idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
+        val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
+        n = int(idx_concat.numel())
+        idx_pad[:n] = idx_concat
+        val_pad[:n] = val_concat
 
-    idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    val_list = [torch.zeros(max_n, dtype=val_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
-    _tpayload = time.monotonic()
-    dist.gather(idx_pad, idx_list, dst=dst, group=group)
-    dist.gather(val_pad, val_list, dst=dst, group=group)
-    if stats is not None:
-        stats["payload"] += time.monotonic() - _tpayload
-        per_elem = idx_pad.element_size() + val_pad.element_size()
-        stats["pad_bytes"] += world * max_n * per_elem
-        stats["useful_bytes"] += sum(totals) * per_elem
-    if rank != 0:
-        return None
+        idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+        val_list = [torch.zeros(max_n, dtype=val_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+        _tpayload = time.monotonic()
+        dist.gather(idx_pad, idx_list, dst=dst, group=group)
+        dist.gather(val_pad, val_list, dst=dst, group=group)
+        if stats is not None:
+            stats["payload"] += time.monotonic() - _tpayload
+            per_elem = idx_pad.element_size() + val_pad.element_size()
+            stats["pad_bytes"] += world * max_n * per_elem
+            stats["useful_bytes"] += sum(totals) * per_elem
+        if rank != 0:
+            return None
 
     # per-rank cumulative offsets into each blob, sliced per param then stitched across ranks
     offs = [[0] * (k + 1) for _ in range(world)]

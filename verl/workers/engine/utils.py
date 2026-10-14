@@ -417,14 +417,17 @@ def _hf_delta_export_batched(gen, snaps: dict, entry_fn):
     # [Round 9] the mcore entry builder splits its cost into fill/xf/scan (see
     # delta_export.ENTRY_TIMING); append it when the backend provides it, then
     # reset for the next sync. Absent for other backends / legacy paths.
+    # [Round 10] fail loud: R9 shipped with the split silently missing -- the
+    # try-import swallowed the AttributeError from an unsynced delta_export.py
+    # and the entry phase (17.8s -> 12.5s -> ?) stayed opaque for a round.
     entry_split = ""
     try:
         from .megatron.delta_export import ENTRY_TIMING as _et
-
-        entry_split = f" (entry: fill={_et['fill']:.1fs} xf={_et['xf']:.1fs} scan={_et['scan']:.1fs})"
+    except Exception as e:
+        logger.warning("[TIMING-EXPORT] entry split unavailable (delta_export.py out of sync?): %r", e)
+    else:
+        entry_split = f" (entry: fill={_et['fill']:.1f}s xf={_et['xf']:.1f}s scan={_et['scan']:.1f}s)"
         _et.update(fill=0.0, xf=0.0, scan=0.0)
-    except Exception:
-        pass
     logger.warning(
         "[TIMING-EXPORT] batched host export done: params=%d changed=%d batches=%d pinned=%s elapsed=%.1fs "
         "(gen=%.1fs stage=%.1fs diff=%.1fs snap=%.1fs entry=%.1fs%s)",
