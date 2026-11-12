@@ -506,7 +506,18 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
+                # 3D+ jagged NestedTensors (e.g. VLM mRoPE position_ids) hit
+                # pytorch/pytorch#153238 in unbind: split_with_sizes is applied
+                # to the wrong dim of _values. Fall back to padded indexing,
+                # mirroring the workaround in chunk_nested_tensor.
+                try:
+                    tensor_lst = tensor.unbind()  # for performance
+                except RuntimeError:
+                    padded = tensor.to_padded_tensor(0)
+                    offsets = tensor.offsets()
+                    lengths = offsets.diff().tolist()
+                    padded_rows = [padded[j, :seq_len] for j, seq_len in enumerate(lengths)]
+                    tensor_lst = padded_rows
                 selected_tensors = [tensor_lst[idx] for idx in indices]
                 data_dict[key] = nested_tensor_from_tensor_list(
                     selected_tensors, ragged_idx=getattr(tensor, "_ragged_idx", tensor.dim() - 1)
