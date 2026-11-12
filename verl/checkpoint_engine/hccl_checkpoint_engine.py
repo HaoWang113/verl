@@ -241,8 +241,8 @@ class HCCLCheckpointEngine(CheckpointEngine):
             self.world_size = world_size
             return
 
-        generation_changed = (
-            group_generation is not None and group_generation != getattr(self, "_group_generation", None)
+        generation_changed = group_generation is not None and group_generation != getattr(
+            self, "_group_generation", None
         )
         if self.rebuild_group or self.pyhccl is None or generation_changed:
             if self.pyhccl is not None:

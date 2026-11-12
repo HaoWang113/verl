@@ -1232,9 +1232,7 @@ class vLLMHttpServer:
                 "other process trees are not owned-accounted"
             )
         if self._engine_cleanup is None:
-            raise RuntimeError(
-                "restart is not enabled on this server: owned-process accounting was never constructed"
-            )
+            raise RuntimeError("restart is not enabled on this server: owned-process accounting was never constructed")
 
         # Gate triple: rejecting + paused + resume set — a parked request sees the
         # rejection, a draining admission is no longer possible (§7.2 shutdown gate).
