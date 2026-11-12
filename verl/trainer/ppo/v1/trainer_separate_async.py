@@ -182,6 +182,22 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             replicas=self.standalone_server_manager.get_replicas(),
         )
 
+        # Rollout-restart wiring (design §7.4): connect the supervisor (mounted by
+        # LLMServerManager.create) with the checkpoint manager — sweep at the sync
+        # entry, fencing/bookkeeping channels, fault report from the tolerance
+        # path, deferred-resume handback. Purely additive; skipped entirely when
+        # rollout.restart.enabled is false (default).
+        restart_supervisor = getattr(self.standalone_server_manager, "restart_supervisor", None)
+        if restart_supervisor is not None:
+            self.standalone_checkpoint_manager.enable_restart(
+                self.config.actor_rollout_ref.rollout.restart,
+                fault_report=restart_supervisor.report_external_fault,
+                sweep_hook=restart_supervisor.sweep,
+                deferred_resume_callback=restart_supervisor.deferred_replica_ready,
+            )
+            restart_supervisor.attach_checkpoint_manager(self.standalone_checkpoint_manager)
+            self.standalone_checkpoint_manager.set_sync_yield_checker(restart_supervisor.recovery_in_flight)
+
         # hybrid engine is in rollout mode after initialization
         if self._enable_hybrid_replicas:
             self.current_mode = HybridEngineMode.ROLLOUT
