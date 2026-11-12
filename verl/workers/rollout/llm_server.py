@@ -20,6 +20,8 @@ Utility classes for manage and request LLM servers:
 import asyncio
 import logging
 import os
+import time
+from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -39,6 +41,41 @@ from verl.workers.rollout.utils import update_prometheus_config
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_ENGINE_FAILURE_CLASSES = {"EngineDeadError", "ActorDiedError", "RayActorError", "WorkerCrashedError"}
+
+
+@dataclass
+class _EngineRecovery:
+    """Bounded-replay budget for one ``generate()`` call (rollout-restart design §7.3).
+
+    The deadline starts lazily at the first engine failure — the window exists to
+    cover the rebuild, so waiting for a healthy server is its whole point. Retries
+    are event-driven (an available server triggers the replay); there is
+    deliberately no retry-interval config (R4 decision record, 2026-11-11).
+    """
+
+    timeout: float
+    max_retries: int
+    retries: int = 0
+    deadline: float | None = None
+
+    def failed(self) -> None:
+        """Count one engine failure; raises RuntimeError past the retry limit (stop-loss)."""
+        if self.deadline is None:
+            self.deadline = time.monotonic() + self.timeout
+        self.retries += 1
+        if self.retries > self.max_retries:
+            raise RuntimeError(f"engine recovery gave up after {self.retries - 1} failed replays")
+
+    def remaining(self) -> float:
+        """Time left in the recovery window; TimeoutError once exhausted."""
+        if self.deadline is None:
+            return self.timeout
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("engine recovery window exhausted")
+        return remaining
+
 
 class LLMServerClient:
     """
@@ -51,6 +88,7 @@ class LLMServerClient:
         self,
         config: DictConfig,
         load_balancer_handle: ray.actor.ActorHandle = None,
+        fault_mailbox: ray.actor.ActorHandle = None,
         **kwargs,
     ):
         """Initialize the LLMServerClient.
@@ -60,9 +98,13 @@ class LLMServerClient:
             load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor
                 that also holds the server-handle registry. Optional; subclasses that
                 manage server routing externally can pass None.
+            fault_mailbox (ray.actor.ActorHandle): rollout-restart passive-death
+                mailbox actor; reports are fire-and-forget and absent (None)
+                unless restart is enabled (design §5.1①).
         """
         self.config = config
         self._load_balancer = load_balancer_handle
+        self._fault_mailbox = fault_mailbox
         # Balancer field declarations, queried lazily once.
         self._lb_require_acquire_fields: list[str] | None = None
         self._lb_require_release_fields: list[str] | None = None
@@ -80,12 +122,142 @@ class LLMServerClient:
         fields = {name: extra[name] for name in self._lb_require_acquire_fields if name in extra}
         return await self._load_balancer.acquire_server.remote(request_id=request_id, **fields)
 
-    def _release_server(self, server_id: str, request_id: str | None = None) -> None:
+    def _release_server(self, server_id: str, request_id: str | None = None, expected_handle: Any = None) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         pool = {"request_id": request_id}
         fields = {name: pool[name] for name in self._lb_require_release_fields if name in pool}
+        if expected_handle is not None:
+            fields["expected_handle"] = expected_handle
         self._load_balancer.release_server.remote(server_id=server_id, **fields)
+
+    def _restart_config(self):
+        rollout = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        return getattr(rollout, "restart", None)
+
+    def _new_engine_recovery(self) -> Optional[_EngineRecovery]:
+        """None unless ``rollout.restart.enabled`` — replay is inherent to enabled=true (R4)."""
+        restart = self._restart_config()
+        if restart is None or not getattr(restart, "enabled", False):
+            return None
+        client_cfg = getattr(restart, "client", None)
+        return _EngineRecovery(
+            timeout=float(getattr(client_cfg, "engine_recovery_timeout", 300.0)),
+            max_retries=int(getattr(client_cfg, "max_engine_retries", 3)),
+        )
+
+    def _server_supports_receipt(self) -> bool:
+        """Only the vLLM server implements generate(recover_engine_failure) so far (SGLang: PR-E)."""
+        rollout = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
+        return getattr(rollout, "name", None) == "vllm"
+
+    @staticmethod
+    def _is_engine_failure(exc: BaseException) -> bool:
+        """Engine/actor death classes only; request-parameter errors propagate untouched (#8168 §2.4.3)."""
+        seen = set()
+        current = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if type(current).__name__ in _ENGINE_FAILURE_CLASSES:
+                return True
+            current = getattr(current, "__cause__", None)
+        return False
+
+    def _report_fault(self, server_id: str, failure) -> None:
+        """Fire-and-forget passive fault report (design §5.1①); failure here only logs."""
+        mailbox = getattr(self, "_fault_mailbox", None)
+        if mailbox is None:
+            return
+        if isinstance(failure, BaseException):
+            error_class = type(failure).__name__
+        else:
+            error_class = "engine_failed_receipt"
+        try:
+            mailbox.report.remote(server_id, {"source": "request_path", "error_class": error_class})
+        except Exception:
+            logger.warning("fault mailbox report failed (non-fatal)", exc_info=True)
+
+    async def _remove_server_if_current(self, server_id: str, server) -> None:
+        """CAS fence at the router; custom balancers fall back to legacy removal (design §13.2)."""
+        try:
+            await self._load_balancer.remove_server_if_current.remote(server_id, server)
+        except Exception:
+            logger.warning("balancer without remove_server_if_current; falling back to remove_servers", exc_info=True)
+            try:
+                await self._load_balancer.remove_servers.remote([server_id])
+            except Exception:
+                logger.warning("remove_servers fallback also failed (non-fatal)", exc_info=True)
+
+    async def _acquire_server_with_recovery(self, request_id: str, recovery, **extra):
+        """Plain acquire without restart (current behavior); bounded pool-wait with it."""
+        if recovery is None:
+            return await self._acquire_server(request_id, **extra)
+        try:
+            return await self._acquire_server(request_id, **extra)
+        except RuntimeError as exc:
+            if "No available servers in load balancer" not in str(exc):
+                raise
+            deadline = time.monotonic() + recovery.remaining()
+            while True:
+                await asyncio.sleep(1.0)
+                try:
+                    return await self._acquire_server(request_id, **extra)
+                except RuntimeError as exc2:
+                    if "No available servers in load balancer" not in str(exc2):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "no rollout server became available within the engine recovery window"
+                        ) from exc2
+
+    async def _generate_on_server(
+        self,
+        server,
+        request_id: str,
+        *,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        recover_engine_failure: bool = False,
+        **kwargs: Any,
+    ) -> TokenOutput:
+        """Issue one generation RPC on the acquired server (extracted from generate)."""
+        multimodal_kwargs = {}
+        if audio_data is not None:
+            multimodal_kwargs["audio_data"] = audio_data
+        if mm_processor_kwargs:
+            multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        # SGLang cannot take raw frames: its video_data accepts only a path/url/base64 or a
+        # processor_output dict. Always hand it the pre-computed payload (None when the model's
+        # processor produced no pixel_values_videos, e.g. a non-Qwen-VL family) and never the raw
+        # frames -- dropping video beats sending SGLang tensors it cannot parse. vLLM keeps the
+        # frames and never enters this branch. Neither server signature accepts **kwargs, so pop.
+        mm_processor_output = kwargs.pop("mm_processor_output", None)
+        if self.config.actor_rollout_ref.rollout.name == "sglang":
+            video_data = mm_processor_output
+        # priority is only supported by vLLM rollout server.
+        priority = kwargs.pop("priority", 0)
+        priority_kwargs = (
+            {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
+        )
+        remote_kwargs = {}
+        if recover_engine_failure:
+            remote_kwargs["recover_engine_failure"] = True
+        return await server.generate.remote(
+            request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            image_data=image_data,
+            video_data=video_data,
+            **multimodal_kwargs,
+            **priority_kwargs,
+            session_id=request_id,
+            **kwargs,
+            **remote_kwargs,
+        )
 
     def _vllm_request_id(self, request_id: str) -> str:
         # request_id passed to vLLM. Default: a fresh uuid per turn so each turn
@@ -117,9 +289,16 @@ class LLMServerClient:
 
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
+
+        With ``rollout.restart.enabled``, an engine failure or an ``engine_failed``
+        receipt triggers bounded replay (design §7.3): the failed server is fenced
+        out of the balancer via CAS removal, the fault is reported to the mailbox,
+        and the request is replayed verbatim once any server is available —
+        in-flight requests are not lost (R4). With restart disabled the code path
+        is the current behavior byte-for-byte (no receipt flag, no retry branch).
         """
-        server_id, server = await self._acquire_server(
-            request_id,
+        recovery = self._new_engine_recovery()
+        acquire_fields = dict(
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
@@ -128,45 +307,46 @@ class LLMServerClient:
             mm_processor_kwargs=mm_processor_kwargs,
             **kwargs,
         )
-        try:
-            multimodal_kwargs = {}
-            if audio_data is not None:
-                multimodal_kwargs["audio_data"] = audio_data
-            if mm_processor_kwargs:
-                multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
-            # SGLang cannot take raw frames: its video_data accepts only a path/url/base64 or a
-            # processor_output dict. Always hand it the pre-computed payload (None when the model's
-            # processor produced no pixel_values_videos, e.g. a non-Qwen-VL family) and never the raw
-            # frames -- dropping video beats sending SGLang tensors it cannot parse. vLLM keeps the
-            # frames and never enters this branch. Neither server signature accepts **kwargs, so pop.
-            mm_processor_output = kwargs.pop("mm_processor_output", None)
-            if self.config.actor_rollout_ref.rollout.name == "sglang":
-                video_data = mm_processor_output
-            # priority is only supported by vLLM rollout server.
-            priority = kwargs.pop("priority", 0)
-            priority_kwargs = (
-                {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
-            )
-            output: TokenOutput = await server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=image_data,
-                video_data=video_data,
-                **multimodal_kwargs,
-                **priority_kwargs,
-                session_id=request_id,
-                **kwargs,
-            )
-            global_steps = output.extra_fields.get("global_steps")
-            output.extra_fields.setdefault("min_global_steps", global_steps)
-            output.extra_fields.setdefault("max_global_steps", global_steps)
-            return output
-        finally:
-            self._release_server(
-                server_id,
-                request_id=request_id,
-            )
+        while True:
+            server_id, server = await self._acquire_server_with_recovery(request_id, recovery, **acquire_fields)
+            try:
+                output = await self._generate_on_server(
+                    server,
+                    request_id,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    image_data=image_data,
+                    video_data=video_data,
+                    audio_data=audio_data,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    recover_engine_failure=recovery is not None and self._server_supports_receipt(),
+                    **kwargs,
+                )
+            except BaseException as exc:
+                if recovery is None or not self._is_engine_failure(exc):
+                    raise
+                self._report_fault(server_id, exc)
+                await self._remove_server_if_current(server_id, server)
+                # Budget check last: exhausting it stops the replay, but the failed
+                # server is already fenced out for every other request.
+                recovery.failed()
+                continue
+            finally:
+                self._release_server(
+                    server_id,
+                    request_id=request_id,
+                    expected_handle=server if recovery is not None else None,
+                )
+            if recovery is None or not output.extra_fields.get("engine_failed"):
+                global_steps = output.extra_fields.get("global_steps")
+                output.extra_fields.setdefault("min_global_steps", global_steps)
+                output.extra_fields.setdefault("max_global_steps", global_steps)
+                return output
+            # engine_failed receipt: same bounded-replay handling (the receipt's partial
+            # prefix is dropped — recompute beats corrupt data, invariant I2).
+            self._report_fault(server_id, output)
+            await self._remove_server_if_current(server_id, server)
+            recovery.failed()
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
@@ -369,6 +549,22 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         return final_output
 
 
+def _mount_restart_supervisor(instance: "LLMServerManager") -> None:
+    """Attach the rollout-restart supervisor when enabled (design §7.4).
+
+    The single wiring point on the manager side. Nothing is imported or
+    instantiated when ``rollout.restart.enabled`` is false — the default
+    scenario keeps its exact current behavior (zero-impact promise, §0/D9).
+    """
+    restart_cfg = getattr(instance.rollout_config, "restart", None)
+    if restart_cfg is None or not getattr(restart_cfg, "enabled", False):
+        return
+    from verl.workers.rollout.restart import ReplicaRestartSupervisor
+
+    instance.restart_supervisor = ReplicaRestartSupervisor(manager=instance, config=restart_cfg)
+    instance.restart_supervisor.start()
+
+
 class LLMServerManager:
     """LLMServerManager is responsible for:
     - Launch server replicas
@@ -420,6 +616,7 @@ class LLMServerManager:
         instance = cls(*args, **kwargs)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
+        _mount_restart_supervisor(instance)
         return instance
 
     @classmethod
@@ -437,6 +634,7 @@ class LLMServerManager:
         instance.server_handles = []
         instance.server_addresses = []
         await instance._init_global_load_balancer()
+        _mount_restart_supervisor(instance)
         return instance
 
     async def _initialize_llm_servers(self, start_rank: int = None):
@@ -540,9 +738,13 @@ class LLMServerManager:
                 request-id handling (e.g. a deterministic client that forwards
                 the caller's ``request_id`` straight to vLLM), or
                 :class:`FullyAsyncLLMServerClient` for abort-resume support.
-            **kwargs: Forwarded to the client constructor.
+            **kwargs: Forwarded to the client constructor. When the restart
+                supervisor is mounted, ``fault_mailbox`` is injected here so
+                clients can report passive death evidence (design §5.1①).
         """
         client_cls = client_cls or LLMServerClient
+        if getattr(self, "restart_supervisor", None) is not None:
+            kwargs.setdefault("fault_mailbox", self.restart_supervisor.mailbox_handle)
         return client_cls(
             config=self.config,
             load_balancer_handle=self.global_load_balancer,
