@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from pprint import pprint
 from typing import Any, Callable, Optional
 
+import psutil
 import ray
 import vllm.entrypoints.cli.serve
 from packaging import version
@@ -120,6 +121,7 @@ class vLLMHttpServer:
         cuda_visible_devices: str,
         disaggregation_role: str = "null",
         disaggregation_kv_transfer_config: Optional[dict] = None,
+        weight_source_override=None,
     ):
         """
         Args:
@@ -133,6 +135,9 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
             disaggregation_role: PD role, or ``"null"`` for normal rollout.
             disaggregation_kv_transfer_config: vLLM KVTransferConfig dict for PD.
+            weight_source_override: rollout-restart route A (design §6.3) — swap the
+                engine's weight source to the checkpoint HF export so it cold-loads
+                during startup; ``None`` (the normal path) uses the configured values.
         """
         if disaggregation_role not in ("null", "prefill", "decode"):
             raise ValueError(f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}")
@@ -160,6 +165,11 @@ class vLLMHttpServer:
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
+        if weight_source_override is not None:
+            # Route A (design §6.3): the engine's weight source is the checkpoint
+            # HF export; TP/DP resharding is the engine's own cold-start capability.
+            self.config.load_format = weight_source_override.load_format
+            self.model_config.local_path = weight_source_override.model_path
         self._validate_configs()
 
         if self.config.full_determinism:
@@ -190,6 +200,21 @@ class vLLMHttpServer:
         self._resume_event.set()
         # Set by abort_all_requests(reject_request=True) when no resume is coming soon.
         self._rejecting = False
+
+        # Rollout-restart bookkeeping (inert unless rollout.restart.enabled — design §0
+        # isolation table): owned-process accounting for the verified shutdown ladder,
+        # the pre-stored executor backend for classifying the process tree before the
+        # engine exists, and the sticky engine-failed flag that serves late requests an
+        # immediate receipt instead of an RPC into a dead engine.
+        restart_cfg = getattr(self.config, "restart", None)
+        if restart_cfg is not None and getattr(restart_cfg, "enabled", False):
+            from verl.workers.rollout.restart import EngineProcessAccounting
+
+            self._engine_cleanup = EngineProcessAccounting()
+        else:
+            self._engine_cleanup = None
+        self._engine_executor_backend = None
+        self._engine_failed = False
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
@@ -371,6 +396,9 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+        # Prestore the executor backend so shutdown() can classify the process tree
+        # even when the engine was never constructed (startup-failure path, design §7.2).
+        self._engine_executor_backend = args["distributed_executor_backend"]
 
         # update profiler args, only on the replica that will actually be profiled: configuring
         # the engine profiler everywhere makes every replica log that profiling is enabled while
@@ -526,7 +554,16 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
-        engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+        if self._engine_cleanup is not None:
+            # Re-check the baseline right before the engine spawns its subprocess tree.
+            self._engine_cleanup.record()
+        try:
+            engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+        finally:
+            # Record the freshly spawned tree (or the partial tree of a failed init —
+            # design §7.2 constructor finally, so shutdown can clean it later).
+            if self._engine_cleanup is not None:
+                self._engine_cleanup.record()
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
@@ -602,12 +639,17 @@ class vLLMHttpServer:
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
         session_id: Optional[str] = None,
+        recover_engine_failure: bool = False,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
             session_id: Sticky caller id; turns of one session go to the same DP engine.
+            recover_engine_failure: When the engine core dies mid-request, return an
+                ``engine_failed`` progress receipt (latest complete prefix) instead of
+                raising ``EngineDeadError``. False (the default) keeps the current
+                behavior: the bare exception propagates to the client.
         """
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
@@ -719,19 +761,34 @@ class vLLMHttpServer:
         if rejected is not None:
             return rejected
 
-        with RLInsightLogger.trace_state(
-            "vllm_generate",
-            state_lane_id=ray.get_runtime_context().get_actor_name(),
-        ):
-            final_res = await self._generate_admitted(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                lora_request=lora_request,
-                priority=priority,
-                data_parallel_rank=self._dp_rank_for_session(session_id),
-            )
-            assert final_res is not None
+        if recover_engine_failure and self._engine_failed:
+            # Sticky receipt (§7.2): the engine is known dead, so serve late requests
+            # without touching it and let the client re-route immediately.
+            from verl.workers.rollout.restart import build_engine_failed_receipt
+
+            return build_engine_failed_receipt(self.global_steps)
+
+        try:
+            with RLInsightLogger.trace_state(
+                "vllm_generate",
+                state_lane_id=ray.get_runtime_context().get_actor_name(),
+            ):
+                final_res = await self._generate_admitted(
+                    prompt=prompt,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                    lora_request=lora_request,
+                    priority=priority,
+                    data_parallel_rank=self._dp_rank_for_session(session_id),
+                )
+        except EngineDeadError as exc:
+            if not recover_engine_failure:
+                raise  # Current behavior: the bare exception propagates.
+            self._engine_failed = True
+            from verl.workers.rollout.restart import build_engine_failed_receipt
+
+            return build_engine_failed_receipt(self.global_steps, partial_output=getattr(exc, "partial_output", None))
+        assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
@@ -1108,8 +1165,98 @@ class vLLMHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
+    async def get_global_steps(self):
+        """Current model weights version (rollout-restart VERIFYING stamp check)."""
+        return self.global_steps
+
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
+
+    async def check_health(self) -> None:
+        """Liveness probe: raises when the engine core is dead (rollout-restart sweep).
+
+        Never reads metrics gauges — liveness must not depend on observability
+        config (``disable_log_stats=True`` is the default). The engine raises
+        ``EngineDeadError`` when the core is gone. Raises ``RuntimeError`` when
+        called on an actor that cannot own an engine (headless node of a
+        multi-node replica, or before launch).
+        """
+        if self.node_rank != 0 or not hasattr(self, "engine"):
+            raise RuntimeError(
+                f"check_health requires the node-rank-0 AsyncLLM (node_rank={self.node_rank}, "
+                f"engine_constructed={hasattr(self, 'engine')})"
+            )
+        await self.engine.check_health()
+        if self._engine_cleanup is not None:
+            # Opportunistic refresh of the owned-process accounting (§7.2).
+            self._engine_cleanup.record()
+
+    def _resolve_engine_executor_backend(self) -> Optional[str]:
+        """Executor backend via the two-level rule (§7.2): live engine config first,
+        the pre-stored value from launch_server second; both absent -> None."""
+        engine = getattr(self, "engine", None)
+        vllm_config = getattr(engine, "vllm_config", None) if engine is not None else None
+        if vllm_config is not None:
+            backend = getattr(getattr(vllm_config, "parallel_config", None), "distributed_executor_backend", None)
+            if backend:
+                return str(backend)
+        return getattr(self, "_engine_executor_backend", None)
+
+    async def shutdown(self) -> tuple[int, float]:
+        """Verified teardown of this server's engine processes (rollout-restart §7.2).
+
+        Closes the submission gate in rejecting mode (parked requests observe
+        rejection instead of waiting for a resume that will never come), asks
+        the engine to shut down (failure logged, not raised — the accounting
+        ladder below is the real guarantee), then walks the owned process
+        accounting: bounded wait -> SIGTERM -> SIGKILL -> survivors raise
+        :class:`EngineShutdownError` (fail-closed).
+
+        Returns this actor's ``(pid, create_time)`` — the identity the
+        five-segment teardown's witness probe double-confirms after the actor
+        kill: the HTTP listener lives in this process, so the port is only
+        truly free once this process is gone.
+        """
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            raise NotImplementedError(f"shutdown() requires STANDALONE rollout, got {self.rollout_mode}")
+        if self.nnodes != 1 or self.node_rank != 0:
+            raise NotImplementedError(
+                f"shutdown() requires a single-node replica (nnodes={self.nnodes}, node_rank={self.node_rank})"
+            )
+        if self._disaggregation_role != "null":
+            raise NotImplementedError("shutdown() does not support PD disaggregation")
+        executor = self._resolve_engine_executor_backend()
+        if executor != "mp":
+            raise NotImplementedError(
+                f"shutdown() requires the 'mp' distributed executor (got {executor!r}); "
+                "other process trees are not owned-accounted"
+            )
+        if self._engine_cleanup is None:
+            raise RuntimeError(
+                "restart is not enabled on this server: owned-process accounting was never constructed"
+            )
+
+        # Gate triple: rejecting + paused + resume set — a parked request sees the
+        # rejection, a draining admission is no longer possible (§7.2 shutdown gate).
+        self._rejecting = True
+        self._submission_paused = True
+        self._resume_event.set()
+        self._engine_failed = True
+
+        if hasattr(self, "engine"):
+            shutdown_fn = getattr(self.engine, "shutdown", None)
+            if callable(shutdown_fn):
+                try:
+                    result = shutdown_fn()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.exception("engine.shutdown() failed; proceeding with the process cleanup ladder")
+
+        self._engine_cleanup.shutdown_owned()
+
+        proc = psutil.Process()
+        return proc.pid, proc.create_time()
 
     async def abort_all_requests(
         self,
@@ -1303,6 +1450,10 @@ class vLLMHttpServer:
                     continue
                 final_res = output
         except (asyncio.CancelledError, Exception) as e:
+            if isinstance(e, EngineDeadError):
+                # Progress accumulated before the core died: the engine-failed receipt's
+                # data source (§7.2). May be None when death preceded any output.
+                e.partial_output = final_res
             # Client disconnected or the request failed mid-flight: drop it from the engine like
             # AsyncLLM.generate() does, so no orphaned request is left in the scheduler. The collector
             # holds vLLM's internal request id, which may differ from the caller's request_id.
@@ -1575,8 +1726,13 @@ class vLLMReplica(RolloutReplica):
         )
         self.server_class = ray.remote(vLLMHttpServer)
 
-    async def launch_servers(self):
-        """Launch http server in each node."""
+    async def launch_servers(self, weight_source_override=None):
+        """Launch http server in each node.
+
+        Args:
+            weight_source_override: rollout-restart route A — the replacement
+                server cold-loads the checkpoint HF export at startup (§6.3).
+        """
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
@@ -1634,6 +1790,7 @@ class vLLMReplica(RolloutReplica):
                 gpus_per_node=gpus_per_replica_node,
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
+                weight_source_override=weight_source_override,
             )
             self.servers.append(server)
 
@@ -1747,3 +1904,21 @@ class vLLMReplica(RolloutReplica):
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix (e.g. 'vllm_')."""
         return "vllm_"
+
+    def _pre_relaunch_cleanup(self) -> None:
+        """Unlink stale weight-transfer IPC sockets left by the old engine tree.
+
+        The socket path embeds the Ray job id, which protects against *other*
+        jobs but not against a same-job restart — a stale file makes the new
+        receiver fail with EADDRINUSE (the known hazard called out in
+        vllm_rollout.py's socket-path comment; design §6.1).
+        """
+        import glob
+
+        job_id = ray.get_runtime_context().get_job_id()
+        pattern = f"/tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-*.sock"
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+            except OSError:
+                logger.warning("failed to unlink stale IPC socket %s", path, exc_info=True)
