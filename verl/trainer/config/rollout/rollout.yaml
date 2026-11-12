@@ -354,6 +354,65 @@ enable_rollout_routing_replay: False
 moe_load_balance_metrics_interval: 0
 
 
+# Rollout-side independent restart (Phase 1). Single master switch: enabled
+# defaults to false and every hook this feature adds is unreachable then —
+# merged code has zero impact on default scenarios.
+restart:
+
+  # Target class for restart config
+  _target_: verl.workers.config.RolloutRestartConfig
+
+  # Master switch (default false): detection + unified replica rebuild +
+  # route-A/B weight recovery + client bounded replay all live behind it.
+  enabled: false
+
+  # Single check_health probe timeout in seconds (sweep first probe and the
+  # immediate re-probe share it). Detection is event-driven: there is no
+  # patrol-interval config by design.
+  probe_timeout_s: 10.0
+
+  # Weight source after a rebuild: "checkpoint" = route A first (engine cold
+  # start from the checkpoint HF export) with automatic degradation to route B
+  # (wait for the next weight sync) when no valid checkpoint exists;
+  # "next_weight_sync" = always route B.
+  weight_source: checkpoint
+
+  # Route-A checkpoint root; null -> trainer.default_local_dir.
+  checkpoint_dir: null
+
+  # Upper bound for checkpoint locate/validation (guards against a hung
+  # shared filesystem stalling the cold start).
+  locate_timeout_s: 30.0
+
+  # Upper bound for route-A weight loading / route-B empty start readiness.
+  cold_start_timeout_s: 600.0
+
+  # Upper bound for the rebuild cleanup segments (server five-segment
+  # teardown + CE terminal waits); does not cover respawn or weight loading.
+  cleanup_timeout_s: 60.0
+
+  # Bounded wait for the restart bookkeeping lock at the update_weights entry.
+  sync_lock_wait_s: 120.0
+
+  # Bounded wait for the weight commit before tearing down workers stuck on
+  # a dead peer's collective.
+  bounded_abort_s: 120.0
+
+  # Per-replica restart budget (anti-flapping).
+  retry_budget:
+    _target_: verl.workers.config.RestartBudgetConfig
+    max_restarts: 3
+    window_s: 3600.0
+    cooldown_s: 30.0
+
+  # Client bounded-replay budget. Replay is inherent to enabled=true — there
+  # is deliberately no disable switch; only these budgets are tunable.
+  client:
+    _target_: verl.workers.config.RestartClientConfig
+    engine_recovery_timeout: 300.0
+    max_engine_retries: 3
+
+
 # profile the rollout model in `generate_sequence`
 profiler:
 
