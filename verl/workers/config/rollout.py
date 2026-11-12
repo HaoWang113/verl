@@ -33,6 +33,9 @@ __all__ = [
     "RolloutConfig",
     "RolloutQuantizationConfig",
     "CheckpointEngineConfig",
+    "RolloutRestartConfig",
+    "RestartBudgetConfig",
+    "RestartClientConfig",
 ]
 
 
@@ -140,6 +143,63 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
+
+
+@dataclass
+class RestartBudgetConfig(BaseConfig):
+    """Per-replica restart budget (anti-flapping, design §7.1)."""
+
+    max_restarts: int = 3
+    window_s: float = 3600.0
+    cooldown_s: float = 30.0
+
+
+@dataclass
+class RestartClientConfig(BaseConfig):
+    """Client bounded-replay budget (design §7.3).
+
+    Replay is inherent to ``restart.enabled=true`` — there is deliberately no
+    disable switch (R4 decision record); only these budgets are tunable.
+    """
+
+    engine_recovery_timeout: float = 300.0
+    max_engine_retries: int = 3
+
+
+@dataclass
+class RolloutRestartConfig(BaseConfig):
+    """Rollout-side independent restart (Phase 1, design §8).
+
+    Single master switch: ``enabled`` defaults to False and every hook added by
+    the feature is unreachable in that case — merged code has zero impact on
+    default scenarios (design §0/D9).
+    """
+
+    enabled: bool = False
+
+    probe_timeout_s: float = 10.0
+    """Single check_health probe timeout (sweep first probe and re-probe share it).
+
+    Detection is event-driven (design §5.1): no patrol-interval config exists.
+    """
+
+    weight_source: str = "checkpoint"
+    """``checkpoint`` = route A first with automatic degradation to B;
+    ``next_weight_sync`` = always route B (explicitly skip disk cold start).
+    """
+
+    checkpoint_dir: Optional[str] = None
+    """Route-A checkpoint root; defaults to ``trainer.default_local_dir``."""
+
+    locate_timeout_s: float = 30.0
+    cold_start_timeout_s: float = 600.0
+    cleanup_timeout_s: float = 60.0
+    sync_lock_wait_s: float = 120.0
+    bounded_abort_s: float = 120.0
+    """Bounded wait for the weight commit before tearing down stuck collectives (§6.5.1)."""
+
+    retry_budget: RestartBudgetConfig = field(default_factory=RestartBudgetConfig)
+    client: RestartClientConfig = field(default_factory=RestartClientConfig)
 
 
 @dataclass
@@ -285,6 +345,10 @@ class RolloutConfig(BaseConfig):
 
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
+
+    # Rollout-side independent restart (Phase 1). Everything it adds is gated by
+    # restart.enabled (default False): merged code has zero default impact.
+    restart: RolloutRestartConfig = field(default_factory=RolloutRestartConfig)
 
     profiler: Optional[ProfilerConfig] = None
 
