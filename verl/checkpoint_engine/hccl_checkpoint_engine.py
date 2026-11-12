@@ -158,6 +158,28 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.recv_buf = None
         torch.npu.empty_cache()
 
+    def teardown(self):
+        """Best-effort abort of a stuck collective (rollout-restart §6.5.1 branch c).
+
+        Destroys the communicator and releases the transfer buffers so a worker
+        stuck on a dead peer's collective gets healed by the next sync (a fresh
+        stateless group is built whenever ``pyhccl is None``). Failures are
+        swallowed on purpose: the supervisor's rebuild ray-kills whatever this
+        cannot fix.
+        """
+        if self.pyhccl is not None:
+            try:
+                self.pyhccl.destroyComm(self.pyhccl.comm)
+            except Exception:
+                logger.warning("teardown: destroyComm failed (best-effort)", exc_info=True)
+            self.pyhccl = None
+        self.send_buf = None
+        self.recv_buf = None
+        try:
+            torch.npu.empty_cache()
+        except Exception:
+            pass
+
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
         actor_wg_kwargs = {
@@ -199,12 +221,19 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
 
-    def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
+    def init_process_group(
+        self, rank: int, world_size: int, master_metadata: MasterMetadata, group_generation: int | None = None
+    ):
         """Initialize the HCCL process group.
 
         Args:
             rank (int): The rank of the current process.
             world_size (int): The total number of processes.
+            group_generation: rollout-restart fencing generation (design §7.3).
+                A change of generation destroys the cached communicator and
+                rebuilds it, so a membership change cannot trip the idempotent
+                reuse assertions below with a stale world_size. ``None`` keeps
+                the current behavior.
         """
         # For actor workers other than rank 0, their rank should be -1.
         if rank < 0:
@@ -212,10 +241,20 @@ class HCCLCheckpointEngine(CheckpointEngine):
             self.world_size = world_size
             return
 
-        if self.rebuild_group or self.pyhccl is None:
+        generation_changed = (
+            group_generation is not None and group_generation != getattr(self, "_group_generation", None)
+        )
+        if self.rebuild_group or self.pyhccl is None or generation_changed:
+            if self.pyhccl is not None:
+                try:
+                    self.pyhccl.destroyComm(self.pyhccl.comm)
+                except Exception:
+                    logger.warning("failed to destroy the previous HCCL communicator", exc_info=True)
+                self.pyhccl = None
             self.pyhccl = stateless_init_process_group(
                 master_metadata.dist_ip, master_metadata.dist_port, rank, world_size, self.device
             )
+            self._group_generation = group_generation
             self.rank = rank
             self.world_size = world_size
         else:

@@ -143,6 +143,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
     ) -> None:
         self.bucket_size = bucket_size
         self.group_name = group_name
+        # Rollout-restart fencing base (design §7.3): self.group_name becomes the
+        # generation-derived fenced name once a group_generation kwarg arrives;
+        # this base keeps the derivation stable across successive generations.
+        self._base_group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
         self.multi_sender = multi_sender
@@ -191,6 +195,26 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.recv_buf = None
 
         torch.cuda.empty_cache()
+
+    def teardown(self):
+        """Best-effort abort of a stuck collective (rollout-restart §6.5.1 branch c).
+
+        Destroys the current group and releases the transfer buffers so a
+        worker stuck on a dead peer's collective can be healed by the next
+        sync under a fenced name. Failures are swallowed on purpose: the
+        supervisor's rebuild ray-kills whatever this cannot fix.
+        """
+        try:
+            if getattr(self, "rank", None) is not None and self.rank >= 0:
+                collective.destroy_collective_group(self.group_name)
+        except Exception:
+            logger.warning("teardown: destroy_collective_group failed (best-effort)", exc_info=True)
+        self.send_buf = None
+        self.recv_buf = None
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     @staticmethod
     def _single_sender_ranks(actor_wg_world_size: int) -> list[int]:
@@ -276,7 +300,14 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
 
-    def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata, num_senders: int):
+    def init_process_group(
+        self,
+        rank: int,
+        world_size: int,
+        master_metadata: MasterMetadata,
+        num_senders: int,
+        group_generation: int | None = None,
+    ):
         """Initialize the NCCL process group.
 
         Args:
@@ -285,6 +316,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
             master_metadata (MasterMetadata): The endpoint of the broadcast source.
             num_senders (int): How many actor-side ranks the group starts with. Ranks below this
                 send or relay weights; ranks at or above it consume them.
+            group_generation: rollout-restart fencing generation (design §7.3).
+                When set, this worker joins the derived fenced name
+                (``{base}_ft_g{N}``) so a membership change forces a fresh group
+                instead of tripping the idempotent-reuse assertions below with a
+                stale world_size. ``None`` keeps the current behavior.
         """
         self.num_senders = num_senders
 
@@ -293,6 +329,17 @@ class NCCLCheckpointEngine(CheckpointEngine):
             self.rank = rank
             self.world_size = world_size
             return
+
+        if group_generation:
+            fenced_name = f"{self._base_group_name}_ft_g{group_generation}"
+            if self.group_name != fenced_name and collective.is_group_initialized(self.group_name):
+                # Membership changed: destroy the previous generation's group so
+                # the fenced rebuild cannot leak communicators across restarts.
+                try:
+                    collective.destroy_collective_group(self.group_name)
+                except Exception:
+                    logger.warning("failed to destroy previous group %s", self.group_name, exc_info=True)
+            self.group_name = fenced_name
 
         if self.rebuild_group or not collective.is_group_initialized(self.group_name):
             collective.init_collective_group(world_size, rank, "nccl", self.group_name)
