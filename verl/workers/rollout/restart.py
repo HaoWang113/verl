@@ -313,27 +313,52 @@ class ReplicaRuntimeState(str, Enum):
 class ReplicaFaultMailbox:
     """Append-only mailbox for cross-process death reports.
 
-    Clients (AgentLoopWorker processes) fire-and-forget ``report`` at it; the
-    supervisor drains at every sync entry. Handlers only append and dedup
-    (O(1)) so the reporting channel can never be blocked by a supervisor that
-    is busy executing a minutes-long rebuild (design §5.1①, the v1 flaw where
-    a serialized detector copy silently dropped reports).
+    Clients (AgentLoopWorker processes) fire-and-forget ``report`` at it. Two
+    consumers: the supervisor's resident awaiter (``wait_next`` — event-driven,
+    woken by the report RPC itself, §5.1① rev 2026-11-14) and the sweep's
+    drain-based reconciliation backstop (§5.1②). Handlers only append, dedup
+    (O(1)) and flip an asyncio.Event, so the reporting channel can never be
+    blocked by a supervisor that is busy executing a minutes-long rebuild
+    (design §5.1①, the v1 flaw where a serialized detector copy silently
+    dropped reports).
     """
 
     def __init__(self):
         self._reports: list[tuple[str, dict]] = []
         self._seen: set[tuple[str, str]] = set()
+        self._event = asyncio.Event()
 
-    def report(self, server_id: str, evidence: dict) -> None:
+    async def report(self, server_id: str, evidence: dict) -> None:
         key = (server_id, str(evidence.get("error_class", "")))
         if key in self._seen:
             return
         self._seen.add(key)
         self._reports.append((server_id, dict(evidence)))
+        self._event.set()
 
-    def drain(self) -> list[tuple[str, dict]]:
+    async def wait_next(self, timeout_s: float | None = None) -> list[tuple[str, dict]]:
+        """Block until at least one report is pending, then return and clear.
+
+        Event-driven hand-off: no timer, no probing — the caller's future is
+        woken by the ``report`` RPC itself. ``timeout_s=None`` waits
+        indefinitely (the awaiter); a finite timeout returns ``[]`` on expiry
+        (tests). Never raises. Batch consumption resets the dedup window,
+        same semantics as ``drain``.
+        """
+        if not self._reports:
+            try:
+                await asyncio.wait_for(self._event.wait(), timeout_s)
+            except asyncio.TimeoutError:
+                return []
         reports, self._reports = self._reports, []
         self._seen = set()
+        self._event.clear()
+        return reports
+
+    async def drain(self) -> list[tuple[str, dict]]:
+        reports, self._reports = self._reports, []
+        self._seen = set()
+        self._event.clear()
         return reports
 
 
@@ -358,9 +383,11 @@ def _unwrap_ray_exception(exc: BaseException) -> BaseException:
 class ReplicaRestartSupervisor:
     """Detection + orchestration state machine, owned by ``LLMServerManager`` (design §3.3).
 
-    Detection is event-driven with no resident loops (design §5.1, 2026-11-12
-    decision): the two mount points are the request path (via the mailbox) and
-    the ``update_weights`` entry sweep. Recovery runs as on-demand tasks on the
+    Detection is event-driven (design §5.1, 2026-11-12 decision, revised
+    2026-11-14): request-path reports are consumed immediately by a resident
+    awaiter that the report RPC itself wakes (no timers, no probing, zero idle
+    cost); the ``update_weights`` entry sweep remains the reconciliation and
+    idle-window backstop. Recovery runs as on-demand tasks on the
     supervisor's own loop so a rebuild never blocks the trainer's sync.
 
     ``restart.enabled=false`` means this class is never instantiated — every
@@ -382,6 +409,8 @@ class ReplicaRestartSupervisor:
         self._mailbox: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        self._awaiter_handle: Any = None
+        self._schedule_lock = threading.Lock()  # sweep (trainer loop) vs awaiter/tolerance (supervisor loop)
         self._stopped = False
 
     # ── lifecycle ───────────────────────────────────────────────────────
@@ -395,14 +424,43 @@ class ReplicaRestartSupervisor:
         )
         self._loop_thread.start()
         self._mailbox = ReplicaFaultMailbox.remote()
+        self._start_mailbox_awaiter()
 
     def recovery_in_flight(self) -> bool:
         """True while any replica is between fault confirmation and re-registration."""
         return bool(self._recovering)
 
+    def _start_mailbox_awaiter(self) -> None:
+        """Spawn the resident event-driven consumer of request-path reports (§5.1① rev).
+
+        The awaiter blocks on the mailbox's ``wait_next`` — no timer, no probing,
+        zero idle cost; the report RPC itself is the wake-up source. This is what
+        makes conviction independent of the sync step (2026-11-14 ruling: a
+        load-window fault must start recovery immediately, not at the next
+        update_weights).
+        """
+        if self._mailbox is None:
+            return
+        self._awaiter_handle = asyncio.run_coroutine_threadsafe(self._mailbox_awaiter(), self._loop)
+
+    async def _mailbox_awaiter(self) -> None:
+        while not self._stopped:
+            try:
+                reports = await self._mailbox.wait_next.remote()
+                await self._consume_reports(reports)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # Awaiter discipline (§9.1-4, same as the sweep): a broken
+                # detection channel must never take the supervisor down.
+                logger.warning("mailbox awaiter iteration failed (non-fatal); 1s backoff", exc_info=True)
+                await asyncio.sleep(1.0)
+
     def stop(self) -> None:
         """Idempotent shutdown: stop accepting events; in-flight rebuilds finish."""
         self._stopped = True
+        if self._awaiter_handle is not None:
+            self._awaiter_handle.cancel()
         loop = self._loop
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
@@ -421,28 +479,40 @@ class ReplicaRestartSupervisor:
         """Full-membership verification at the update_weights entry (§5.1②).
 
         Never raises: a broken detection channel must not break the sync
-        (sweep discipline, §9.1-4). Drains the mailbox, probes every SERVING
-        replica, and schedules recovery for confirmed faults.
+        (sweep discipline, §9.1-4). Reconciles mailbox reports the awaiter
+        has not consumed yet (backstop), probes every SERVING replica, and
+        schedules recovery for confirmed faults.
         """
         try:
             reports = await self._mailbox.drain.remote() if self._mailbox is not None else []
         except Exception:
             logger.warning("mailbox drain failed (non-fatal)", exc_info=True)
             reports = []
+        await self._consume_reports(reports)
 
+        replicas = list(getattr(self._manager, "rollout_replicas", []) or [])
+        replica_by_key = {self._replica_key(r): r for r in replicas}
+        for key, replica in replica_by_key.items():
+            await self._probe_and_classify(replica, key)
+
+    async def _consume_reports(self, reports: list[tuple[str, dict]]) -> None:
+        """Verify mailbox death reports against live membership (§5.1①).
+
+        Shared consumer for the awaiter (immediate) and the sweep
+        (reconciliation backstop); idempotent — verification and conviction
+        are state-gated, so double consumption is harmless.
+        """
+        if not reports:
+            return
         replicas = list(getattr(self._manager, "rollout_replicas", []) or [])
         addresses = list(getattr(self._manager, "server_addresses", []) or [])
         replica_by_key = {self._replica_key(r): r for r in replicas}
         key_by_address = dict(zip(addresses, (self._replica_key(r) for r in replicas), strict=True))
-
         for server_id, evidence in reports:
             key = key_by_address.get(server_id)
             if key is None:
                 continue
             await self._verify_report(replica_by_key[key], key, evidence)
-
-        for key, replica in replica_by_key.items():
-            await self._probe_and_classify(replica, key)
 
     async def _probe_replica(self, replica) -> Optional[FaultEvidence]:
         """One health pass: GCS actor states (authoritative) + engine probe."""
@@ -534,10 +604,11 @@ class ReplicaRestartSupervisor:
     def _schedule_recovery(self, replica, key: str, evidence: FaultEvidence) -> None:
         if self._loop is None or self._stopped:
             return
-        if key in self._recovering:
-            logger.info("recovery already in flight for replica %s", key)
-            return
-        self._recovering.add(key)
+        with self._schedule_lock:  # sweep (trainer loop) vs awaiter/tolerance (supervisor loop)
+            if key in self._recovering:
+                logger.info("recovery already in flight for replica %s", key)
+                return
+            self._recovering.add(key)
         future = asyncio.run_coroutine_threadsafe(self._handle_confirmed_fault(replica, key, evidence), self._loop)
         future.add_done_callback(lambda _fut, _key=key: self._recovery_finished(_key))
 

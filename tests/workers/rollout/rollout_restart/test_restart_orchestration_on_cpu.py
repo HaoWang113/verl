@@ -74,6 +74,59 @@ class TestFaultMailbox:
         assert len(ray.get(mailbox.drain.remote())) == 1
 
 
+class TestMailboxWaitNext:
+    def test_wait_next_wakes_on_report_and_resets_dedup(self):
+        ray.init(ignore_reinit_error=True)
+        mailbox = ReplicaFaultMailbox.remote()
+        ray.get(mailbox.report.remote("addr-0", {"source": "request_path", "error_class": "EngineDeadError"}))
+        reports = ray.get(mailbox.wait_next.remote(timeout_s=5.0))
+        assert len(reports) == 1 and reports[0][0] == "addr-0"
+        assert ray.get(mailbox.wait_next.remote(timeout_s=0.2)) == []
+        ray.get(mailbox.report.remote("addr-0", {"source": "request_path", "error_class": "EngineDeadError"}))
+        # Batch consumption resets the dedup window, same semantics as drain.
+        assert len(ray.get(mailbox.wait_next.remote(timeout_s=5.0))) == 1
+
+
+class TestMailboxAwaiter:
+    def test_request_path_report_convicts_immediately_without_sweep(self):
+        """§5.1① rev: a request-path report convicts via the resident awaiter —
+        no update_weights sweep is ever invoked in this scenario."""
+        import time
+
+        from verl.workers.rollout.restart import FaultEvidence
+
+        ray.init(ignore_reinit_error=True)
+        supervisor, manager = _supervisor_with_fake_manager()
+        supervisor.start()
+        try:
+            scheduled = []
+            supervisor._schedule_recovery = lambda replica, key, evidence: scheduled.append(key)
+
+            class _DeadReplica:
+                replica_rank = 0
+                name_suffix = ""
+                servers = []
+                workers = []
+
+            manager.rollout_replicas = [_DeadReplica()]
+            manager.server_addresses = ["addr-0"]
+            supervisor._probe_replica = lambda r: _async_value(
+                FaultEvidence(source="sweep", error_class="EngineDeadError")
+            )
+
+            # Fire-and-forget exactly as the request path does (llm_server._report_fault).
+            supervisor.mailbox_handle.report.remote(
+                "addr-0", {"source": "request_path", "error_class": "EngineDeadError"}
+            )
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and supervisor.get_state("0") != ReplicaRuntimeState.ISOLATED:
+                time.sleep(0.05)
+            assert supervisor.get_state("0") == ReplicaRuntimeState.ISOLATED
+            assert scheduled == ["0"]
+        finally:
+            supervisor.stop()
+
+
 def _make_megatron_step(root, step, complete=True, with_hf=True):
     step_dir = root / f"global_step_{step}"
     model_dir = step_dir / "actor" / "model"
