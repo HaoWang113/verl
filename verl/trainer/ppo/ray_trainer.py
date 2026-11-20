@@ -27,6 +27,7 @@ from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
+import ray
 import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -959,7 +960,7 @@ class RayPPOTrainer:
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
-            llm_client=self.llm_server_manager.get_client(),
+            llm_client=ray.get(self.llm_server_manager.get_client.remote()),
             teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
@@ -974,7 +975,7 @@ class RayPPOTrainer:
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
+            replicas=ray.get(self.llm_server_manager.get_replicas.remote()),
         )
 
         # sleep all replicas to load checkpoint
@@ -1509,11 +1510,11 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
-                            self.llm_server_manager.start_profile()
+                            ray.get(self.llm_server_manager.start_profile.remote())
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
-                            self.llm_server_manager.stop_profile()
+                            ray.get(self.llm_server_manager.stop_profile.remote())
 
                         timing_raw.update(combined_gen_output.meta_info["timing"])
                         combined_gen_output.meta_info.pop("timing", None)
