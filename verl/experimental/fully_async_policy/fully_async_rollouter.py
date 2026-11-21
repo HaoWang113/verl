@@ -175,8 +175,9 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             return 0
 
         try:
-            # Single atomic batch RPC: register all handles + add all to LB pool.
-            await self.global_load_balancer.add_servers.remote(servers=servers_to_add)
+            # Single atomic batch registration: register all handles + add all
+            # to the embedded load balancer pool (in-process call).
+            self.global_load_balancer.add_servers(servers=servers_to_add)
 
             # Track locally for introspection / Prometheus.
             for rid in valid_resource_ids:
@@ -230,8 +231,9 @@ class FullyAsyncLLMServerManager(LLMServerManager):
             return 0
 
         try:
-            # Single atomic batch RPC: remove all from LB pool + purge handles.
-            await self.global_load_balancer.remove_servers.remote(server_ids=server_ids_to_remove)
+            # Single atomic batch removal: remove all from the embedded load
+            # balancer pool + purge handles (in-process call).
+            self.global_load_balancer.remove_servers(server_ids=server_ids_to_remove)
 
             # Clean up local tracking lists.
             for rid in valid_resource_ids:
@@ -265,6 +267,14 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         """Return the number of currently active hybrid replicas."""
         return len(self.alive_replicas)
 
+    async def get_hybrid_replica(self, resource_id: str) -> RolloutReplica | None:
+        """(actor accessor) the registered hybrid replica for ``resource_id``, or None."""
+        return self.hybrid_replicas.get(resource_id)
+
+    async def get_all_hybrid_replicas(self) -> dict[str, RolloutReplica]:
+        """(actor accessor) all registered hybrid replicas (sleeping + active)."""
+        return dict(self.hybrid_replicas)
+
     def get_hybrid_replicas_info(self) -> list[dict]:
         """Return metadata for all active hybrid replicas."""
         return [{"resource_id": rid, "server_address": addr} for rid, addr in self.alive_addresses.items()]
@@ -289,7 +299,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         """
         return self.rollout_replicas
 
-    def get_client(self, client_cls=FullyAsyncLLMServerClient, **kwargs) -> LLMServerClient:
+    async def get_client(self, client_cls=FullyAsyncLLMServerClient, **kwargs) -> LLMServerClient:
         """Override to automatically inject ``only_hybrid`` into the client.
 
         When there are no standalone replicas, hybrid replicas are the sole
@@ -299,7 +309,7 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         ``only_hybrid`` retry support is only implemented there.
         """
         only_hybrid = len(self.rollout_replicas) == 0
-        return super().get_client(client_cls=client_cls, only_hybrid=only_hybrid, **kwargs)
+        return await super().get_client(client_cls=client_cls, only_hybrid=only_hybrid, **kwargs)
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
@@ -500,8 +510,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = (
-                self.llm_server_manager.get_active_server_count() * self.concurrent_samples_per_replica
+            self.max_concurrent_samples = await self.llm_server_manager.get_active_server_count.remote() * (
+                self.concurrent_samples_per_replica
             )
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
@@ -525,7 +535,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     def get_replicas(self):
         """Get rollout worker group"""
-        return self.llm_server_manager.get_replicas()
+        return ray.get(self.llm_server_manager.get_replicas.remote())
 
     def get_max_queue_size(self):
         return self.max_queue_size
@@ -639,11 +649,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _start_profiling(self):
         """Start rollout profiling on all replicas via LLMServerManager after weight sync."""
-        await self.llm_server_manager.start_profile()
+        await self.llm_server_manager.start_profile.remote()
 
     async def _stop_profiling(self):
         """Stop rollout profiling on all replicas before the next weight sync."""
-        await self.llm_server_manager.stop_profile()
+        await self.llm_server_manager.stop_profile.remote()
 
     def do_validate(self):
         """Run validation and return metrics"""
@@ -850,7 +860,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
-            llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
+            llm_client=await self.llm_server_manager.get_client.remote(client_cls=FullyAsyncLLMServerClient),
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )
@@ -1197,13 +1207,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         return self._hybrid_worker_group
 
     async def add_replicas(self, resource_ids: list[str]) -> int:
-        n = await self.llm_server_manager.add_replicas(resource_ids)
+        n = await self.llm_server_manager.add_replicas.remote(resource_ids)
         if n > 0:
             self._update_max_concurrent_samples()
         return n
 
     async def remove_replicas(self, resource_ids: list[str]) -> int:
-        n = await self.llm_server_manager.remove_replicas(resource_ids)
+        n = await self.llm_server_manager.remove_replicas.remote(resource_ids)
         if n > 0:
             self._update_max_concurrent_samples()
         return n
@@ -1237,14 +1247,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             Diagnostics dict from :meth:`GlobalRequestLoadBalancer.clear_sticky_cache`.
         """
         # Step 1: Clear sticky cache so retried requests use least-loaded routing.
-        result = await self.llm_server_manager.global_load_balancer.clear_sticky_cache.remote()
+        result = await self.llm_server_manager.clear_sticky_cache.remote()
         print(
             f"[FullyAsyncRollouter] Rebalance step 1/4: sticky cache cleared, "
             f"{result['cleared_entries']} entries, loads={result['server_loads']}"
         )
 
         # Step 2: Abort in-flight requests on all active replicas.
-        active_replicas = self.llm_server_manager.get_replicas()
+        active_replicas = await self.llm_server_manager.get_replicas.remote()
         if active_replicas:
             await asyncio.gather(*[replica.abort_all_requests() for replica in active_replicas])
             print(f"[FullyAsyncRollouter] Rebalance step 2/4: aborted requests on {len(active_replicas)} replicas")
@@ -1252,10 +1262,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Step 3: Wait until release_server() from all aborted requests has actually
         # landed on the load balancer, i.e. _inflight_requests has drained to 0.
         deadline = time.time() + wait_inflight_timeout_s
-        total_inflight = await self.llm_server_manager.global_load_balancer.get_total_inflight.remote()
+        total_inflight = await self.llm_server_manager.get_total_inflight.remote()
         while total_inflight > 0 and time.time() < deadline:
             await asyncio.sleep(wait_inflight_poll_interval_s)
-            total_inflight = await self.llm_server_manager.global_load_balancer.get_total_inflight.remote()
+            total_inflight = await self.llm_server_manager.get_total_inflight.remote()
         if total_inflight > 0:
             print(
                 f"[FullyAsyncRollouter] Rebalance step 3/4: timed out waiting for in-flight requests to "
@@ -1283,23 +1293,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         if self.max_required_samples is None:
             return
-        new_val = len(self.llm_server_manager.get_replicas()) * self.concurrent_samples_per_replica
+        active_server_count = ray.get(self.llm_server_manager.get_active_server_count.remote())
+        new_val = active_server_count * self.concurrent_samples_per_replica
         new_val = min(new_val, self.max_required_samples)
         print(
             f"[FullyAsyncRollouter] max_concurrent_samples updated: "
             f"{self.max_concurrent_samples} -> {new_val} "
-            f"(active_replicas={len(self.llm_server_manager.get_replicas())})"
+            f"(active_replicas={active_server_count})"
         )
         self.max_concurrent_samples = new_val
         self._record_active_count()
 
     def get_hybrid_replica(self, resource_id: str):
         """Return the RolloutReplica object for a registered hybrid resource."""
-        return self.llm_server_manager.hybrid_replicas.get(resource_id)
+        return ray.get(self.llm_server_manager.get_hybrid_replica.remote(resource_id))
 
     def get_all_hybrid_replicas(self) -> dict:
         """Return all registered hybrid replicas (sleeping + active)."""
-        return dict(self.llm_server_manager.hybrid_replicas)
+        return ray.get(self.llm_server_manager.get_all_hybrid_replicas.remote())
 
     # -------------------------------------------------------------------------
     # Statistics / introspection – delegate to llm_server_manager
@@ -1307,20 +1318,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def get_hybrid_statistics(self) -> dict:
         """Combined rollout + hybrid statistics."""
         base_stats = await self.get_statistics()
-        hybrid_stats = self.llm_server_manager.get_hybrid_statistics()
+        hybrid_stats = await self.llm_server_manager.get_hybrid_statistics.remote()
         return {**base_stats, **hybrid_stats}
 
     def get_num_active_replicas(self) -> int:
         """Total active rollout replicas (standalone + active hybrid)."""
-        return self.llm_server_manager.get_active_server_count()
+        return ray.get(self.llm_server_manager.get_active_server_count.remote())
 
     def get_standalone_replicas(self) -> list:
         """Return standalone-only replicas (hybrid replicas excluded)."""
-        return self.llm_server_manager.get_standalone_replicas()
+        return ray.get(self.llm_server_manager.get_standalone_replicas.remote())
 
     def get_hybrid_replicas_info(self) -> list[dict]:
         """Metadata for all active hybrid replicas."""
-        return self.llm_server_manager.get_hybrid_replicas_info()
+        return ray.get(self.llm_server_manager.get_hybrid_replicas_info.remote())
 
     def get_total_produced_samples(self) -> int:
         """Total samples produced (uses base class counter)."""
