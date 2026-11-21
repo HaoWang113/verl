@@ -182,6 +182,24 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             replicas=ray.get(self.standalone_server_manager.get_replicas.remote()),
         )
 
+        # Rollout-restart wiring: detection and rebuild live in the manager
+        # actor (its factory mounts the supervisor), so the trainer side only
+        # wires the checkpoint manager: the pre-sync membership pull (the
+        # manager's authoritative snapshot -> sync_membership) and the
+        # deferred weight-sync fulfillment RPC (fire-and-forget into the
+        # manager once a deferred replica's weights are installed). Skipped
+        # entirely when rollout.restart.enabled is false.
+        restart_cfg = self.config.get("actor_rollout_ref", {}).get("rollout", {}).get("restart", None)
+        if restart_cfg is not None and restart_cfg.get("enabled", False):
+            from verl.workers.rollout.fault_tolerance import make_deferred_resume_callback, make_pre_sync_reconcile
+
+            self.standalone_checkpoint_manager.enable_sync_survival(
+                pre_sync_hook=make_pre_sync_reconcile(
+                    self.standalone_checkpoint_manager, self.standalone_server_manager
+                ),
+                deferred_resume_callback=make_deferred_resume_callback(self.standalone_server_manager),
+            )
+
         # hybrid engine is in rollout mode after initialization
         if self._enable_hybrid_replicas:
             self.current_mode = HybridEngineMode.ROLLOUT

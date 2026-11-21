@@ -33,6 +33,7 @@ __all__ = [
     "RolloutConfig",
     "RolloutQuantizationConfig",
     "CheckpointEngineConfig",
+    "RolloutFaultToleranceConfig",
 ]
 
 
@@ -140,6 +141,36 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
+
+
+@dataclass
+class RolloutFaultToleranceConfig(BaseConfig):
+    """Rollout-side independent restart.
+
+    ``enabled`` defaults to False and every hook added by the feature is
+    unreachable in that case — merged code has zero impact on default
+    scenarios. All other tunables are internal constants.
+    """
+
+    enabled: bool = False
+
+    weight_source: str = "checkpoint"
+    """``checkpoint`` = cold start from the checkpoint HF export first, with
+    automatic fallback to the next weight sync when no valid checkpoint
+    exists; ``next_weight_sync`` = always defer to the next weight sync
+    (skip the disk cold start).
+    """
+
+    max_restarts: int = 3
+    """Per-replica restarts allowed within the internal 1h sliding window (anti-flapping)."""
+
+    probe_interval_s: float = 10.0
+    """Manager-side polling interval for the single detection channel:
+    every ``probe_interval_s`` the manager actor probes all replicas.
+    Worst-case conviction latency ≈ probe_interval_s + 2 × probe timeout (10s)
+    ≈ 30s with the default; shrink the interval to speed detection linearly.
+    Request-level self-healing (client CAS + bounded replay) is independent of
+    this poll and stays millisecond-scale."""
 
 
 @dataclass
@@ -285,6 +316,10 @@ class RolloutConfig(BaseConfig):
 
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
+
+    # Rollout-side independent restart (Phase 1). Everything it adds is gated by
+    # restart.enabled (default False): merged code has zero default impact.
+    restart: RolloutFaultToleranceConfig = field(default_factory=RolloutFaultToleranceConfig)
 
     profiler: Optional[ProfilerConfig] = None
 

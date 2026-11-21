@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import concurrent.futures
+import logging
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -30,6 +31,12 @@ from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
+
+# Rollout-restart bounded wait (internal constant): the weight-commit wait
+# before tearing down workers stuck on a dead peer's collective.
+_BOUNDED_ABORT_S = 120.0
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -460,6 +467,18 @@ class CheckpointEngineManager:
         self.replicas = replicas
 
         self._update_ticket = None
+        # Sync-survival state (activated by the rollout-restart wiring via
+        # enable_sync_survival), inert by default: no pre-sync hook, no
+        # fencing, fail-fast commit — byte-for-byte current behavior.
+        # Membership is a derived copy of the manager's authoritative snapshot:
+        # refreshed at every update_weights entry, never mutated outside that
+        # boundary.
+        self._sync_survival_enabled = False
+        self._pre_sync_hook = None
+        self._deferred_resume_callback = None
+        self._deferred_resumes: set[str] = set()
+        self._group_generation = 0
+        self._fatal_error: str | None = None
         self._background_loop = asyncio.new_event_loop()
         self._background_loop_ready = threading.Event()
         self._background_loop_thread = threading.Thread(
@@ -471,6 +490,46 @@ class CheckpointEngineManager:
         if not self._background_loop_ready.wait(timeout=5):
             self.close()
             raise RuntimeError("Failed to start CheckpointEngineManager background event loop.")
+
+    def enable_sync_survival(
+        self,
+        pre_sync_hook=None,
+        deferred_resume_callback=None,
+    ) -> None:
+        """Activate the member-failure survival features of weight sync (called
+        once by the rollout-restart wiring; idempotent).
+
+        ``pre_sync_hook``: an async callable run at every ``update_weights``
+        entry — the membership pull reconcile (manager snapshot ->
+        :meth:`sync_membership`). ``deferred_resume_callback(replica_key)``:
+        a deferred replica's weights were installed by a sync — hand control
+        back for verification (the deferred weight-sync fulfillment RPC into the manager).
+        """
+
+        self._sync_survival_enabled = True
+        self._pre_sync_hook = pre_sync_hook
+        self._deferred_resume_callback = deferred_resume_callback
+
+    def mark_fatal(self, message: str) -> None:
+        """Mark the weight-sync pipeline fatally broken: the next
+        ``update_weights`` raises RuntimeError (all replicas DEAD — the
+        current crash path)."""
+        self._fatal_error = message
+
+    @staticmethod
+    def _replica_key(replica: RolloutReplica) -> str:
+        return f"{replica.replica_rank}{getattr(replica, 'name_suffix', '') or ''}"
+
+    def sync_membership(self, snapshot) -> None:
+        """Adopt the manager-authoritative membership snapshot — the syncable
+        replicas (weight-sync group members), the deferred keys, the fencing
+        generation, and the fatal flag. Called by the pre-sync hook at every
+        ``update_weights`` entry; this boundary is the only reader of
+        membership, so there is nothing to race with."""
+        self.replicas = list(snapshot.replicas)
+        self._deferred_resumes = set(snapshot.deferred_keys)
+        self._group_generation = snapshot.group_generation
+        self._fatal_error = snapshot.fatal_error
 
     def _run_background_loop(self):
         asyncio.set_event_loop(self._background_loop)
@@ -511,6 +570,15 @@ class CheckpointEngineManager:
 
         actor_wg_kwargs["method"] = ["init_process_group"] * actor_wg.world_size
         rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
+
+        # Membership-fencing: once the generation has been invalidated,
+        # every member joins under the derived fenced name. Gen 0 (or sync
+        # survival disabled) sends no extra kwargs — engines keep their current
+        # signatures and behavior bit-for-bit.
+        if self._sync_survival_enabled and self._group_generation > 0:
+            generation = self._group_generation
+            actor_wg_kwargs["group_generation"] = [generation] * actor_wg.world_size
+            rollout_kwargs["group_generation"] = [generation] * rollout.world_size
 
         # 3. init process group between all workers
         ray.get(
@@ -603,7 +671,25 @@ class CheckpointEngineManager:
 
         Args:
             global_steps: The global steps of the actor worker group.
+
+        With sync-survival enabled: fatal-flag check first (all replicas DEAD
+        -> RuntimeError, the current crash path), then the pre-sync membership
+        reconcile (pull the manager's authoritative snapshot into this
+        manager) — the only boundary membership is read or written.
         """
+        if self._sync_survival_enabled:
+            if self._fatal_error is not None:
+                raise RuntimeError(f"rollout restart is in a fatal state: {self._fatal_error}")
+            if self._pre_sync_hook is not None:
+                try:
+                    await self._pre_sync_hook()
+                except Exception:
+                    # A broken reconcile must not break the sync; membership
+                    # stays at the last pulled snapshot.
+                    logger.warning("pre-sync membership reconcile failed (non-fatal)", exc_info=True)
+        return await self._update_weights_pipeline(global_steps)
+
+    async def _update_weights_pipeline(self, global_steps: int = None):
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":
             await asyncio.gather(*self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
@@ -623,16 +709,19 @@ class CheckpointEngineManager:
     async def submit_update(self, global_steps: int | None, rollout_quiesced: bool = False) -> WeightUpdateTicket:
         # 1. create a temporay worker group for all replicas
         workers = []
+        replica_slices: list[tuple[RolloutReplica, int, int]] = []
         for replica in self.replicas:
+            start = len(workers)
             workers.extend(replica.workers)
+            replica_slices.append((replica, start, len(workers)))
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
 
         if not self.backend_cls.support_publish_weights:
-            # Coupled transports allocate receive buffers and start collectives in
-            # build_process_group(), so preserve the original ordering: quiesce
-            # rollout and release its KV cache before either of those operations.
-            await self.abort_replicas()
-            await self.release_kv_cache_replicas()
+            # Coupled transports must quiesce rollout before
+            # build_process_group() (same ordering as the pre-restart code);
+            # with restart enabled the abort is best-effort per replica and
+            # the tolerant commit downstream classifies the failure.
+            await self._quiesce_replicas()
 
         # 2. build process group
         self.build_process_group(rollout)
@@ -646,6 +735,7 @@ class CheckpointEngineManager:
                 rollout=rollout,
                 trainer_published=trainer_published,
                 global_steps=global_steps,
+                replica_slices=replica_slices,
             ),
             self._background_loop,
         )
@@ -655,28 +745,177 @@ class CheckpointEngineManager:
             rollout_committed=rollout_committed,
         )
 
+    async def _quiesce_replicas(self) -> None:
+        """Abort + release KV cache, per-replica best-effort when sync survival is enabled."""
+        if not self._sync_survival_enabled:
+            await self.abort_replicas()
+            await self.release_kv_cache_replicas()
+            return
+        await asyncio.gather(*(self._best_effort_abort(r) for r in list(self.replicas)))
+        await asyncio.gather(*(self._best_effort_release(r) for r in list(self.replicas)))
+
+    async def _best_effort_abort(self, replica: RolloutReplica) -> None:
+        """Abort in-flight requests on one replica, swallowing death."""
+        try:
+            await replica.abort_all_requests()
+        except Exception:
+            logger.warning("abort_all_requests failed for replica %s (non-fatal)", self._replica_key(replica))
+
+    async def _best_effort_release(self, replica: RolloutReplica) -> None:
+        """Release KV cache on one replica, swallowing death."""
+        try:
+            await replica.release_kv_cache()
+        except Exception:
+            logger.warning("release_kv_cache failed for replica %s (non-fatal)", self._replica_key(replica))
+
     async def _commit_update(
         self,
         rollout: RayWorkerGroup,
         trainer_published: list[ray.ObjectRef],
         global_steps: int | None,
+        replica_slices: list[tuple[RolloutReplica, int, int]] | None = None,
     ):
-        """Install a published weight version on rollout workers."""
+        """Install a published weight version on rollout workers.
+
+        With sync-survival enabled this is the tolerance path: a per-replica
+        commit failure is stripped instead of failing the whole sync — healthy
+        replicas resume, the failed replica stays fenced (detection and
+        rebuild are the manager's polling business; nothing is reported), and
+        a bounded abort tears down workers stuck on a dead peer's collective
+        (the next sync, under the fenced generation name, heals them). Weight
+        safety: every sync is a full re-push, the version stamp moves only on
+        a complete transfer, and a replica whose commit did not finish serves
+        its last stamped version until the next sync's full re-push restores
+        it. Failed replicas are not resumed at all.
+        """
         if self.backend_cls.support_publish_weights:
-            await self.abort_replicas()
-            await self.release_kv_cache_replicas()
+            await self._quiesce_replicas()
 
         rollout_committed = rollout.update_weights(global_steps=global_steps)
-        results = await asyncio.gather(*trainer_published, *rollout_committed)
 
-        await asyncio.gather(
-            *self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size),
-            *rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size),
-        )
+        if not self._sync_survival_enabled:
+            results = await asyncio.gather(*trainer_published, *rollout_committed)
+            await asyncio.gather(
+                *self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size),
+                *rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size),
+            )
+            await self.resume_kv_cache_replicas()
+            await self.resume_generation_replicas()
+            return self._merge_sync_metrics(results[: self.actor_wg.world_size])
 
-        await self.resume_kv_cache_replicas()
-        await self.resume_generation_replicas()
-        return self._merge_sync_metrics(results[: self.actor_wg.world_size])
+        # ── survival-mode tolerant commit ────────────────────────────────
+        trainer_count = len(trainer_published)
+        futures = [asyncio.ensure_future(ref) for ref in (*trainer_published, *rollout_committed)]
+        try:
+            await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=_BOUNDED_ABORT_S)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # Timeout: some workers are stuck on a dead peer's collective.
+            # CancelledError: ray cancelled a worker future mid-flight (e.g. an
+            # actor died while the ticket waited) — same stuck-member handling.
+            pass
+
+        results = [fut.exception() if fut.done() and not fut.cancelled() else None for fut in futures]
+        done_flags = [fut.done() and not fut.cancelled() for fut in futures]
+        trainer_results = results[:trainer_count]
+        rollout_results = results[trainer_count:]
+        rollout_done = done_flags[trainer_count:]
+
+        failed_replicas, stuck_workers = self._classify_commit_failures(rollout_results, rollout_done, replica_slices)
+
+        finalize_refs = self.actor_wg.execute_checkpoint_engine(
+            ["finalize"] * self.actor_wg.world_size
+        ) + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+        try:
+            await asyncio.wait_for(asyncio.gather(*finalize_refs, return_exceptions=True), timeout=30.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # A stuck worker's finalize queues behind its blocked collective —
+            # the same stuck-member handling as the commit above: swallow and
+            # let the teardown below handle it, so a finalize hang cannot
+            # crash the tolerant commit it exists to save.
+            logger.warning("engine finalize did not finish within 30s (stuck worker assumed); continuing")
+
+        if failed_replicas or stuck_workers:
+            logger.warning(
+                "weight commit finished with failures: failed=%s stuck_workers=%d",
+                [self._replica_key(r) for r in failed_replicas],
+                len(stuck_workers),
+            )
+        if stuck_workers:
+            await self._teardown_survivors(stuck_workers)
+
+        failed_keys = {id(r) for r in failed_replicas}
+        healthy = [r for r in self.replicas if id(r) not in failed_keys]
+        await self._guarded_resume(healthy)
+
+        sync_metrics = self._merge_sync_metrics([r for r in trainer_results if not isinstance(r, BaseException)])
+        if failed_replicas:
+            sync_metrics["restart.failed_replicas"] = [self._replica_key(r) for r in failed_replicas]
+        return sync_metrics
+
+    def _classify_commit_failures(
+        self,
+        rollout_results: list,
+        rollout_done: list[bool],
+        replica_slices: list[tuple[RolloutReplica, int, int]] | None,
+    ):
+        """Map per-worker commit outcomes to (failed replicas, stuck workers):
+        a replica whose worker raised is failed (fenced until the manager's
+        poll convicts and rebuilds it); a worker that never finished is stuck
+        on a collective — torn down and healed by the next sync."""
+        failed: list[RolloutReplica] = []
+        stuck_workers: list = []
+        if not replica_slices:
+            return failed, stuck_workers
+        for replica, start, end in replica_slices:
+            outcomes = rollout_results[start:end]
+            dones = rollout_done[start:end]
+            if any(isinstance(outcome, BaseException) for outcome in outcomes):
+                failed.append(replica)
+            if any(not done for done in dones):
+                stuck_workers.extend(replica.workers)
+        return failed, stuck_workers
+
+    async def _teardown_survivors(self, stuck_workers: list) -> None:
+        """Bounded, best-effort teardown of workers stuck on a dead peer's
+        collective (the manager's rebuild ray-kills whatever this cannot fix)."""
+        if not stuck_workers:
+            return
+        try:
+            group = RayWorkerGroup(
+                worker_handles=stuck_workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls)
+            )
+            refs = group.execute_checkpoint_engine(["teardown"] * len(stuck_workers))
+            await asyncio.wait_for(asyncio.gather(*refs, return_exceptions=True), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "engine teardown of %d stuck worker(s) did not finish within 30s; "
+                "the manager's rebuild will ray.kill them",
+                len(stuck_workers),
+            )
+        except Exception:
+            logger.warning("engine teardown dispatch failed (non-fatal)", exc_info=True)
+
+    async def _guarded_resume(self, replicas: list[RolloutReplica]) -> None:
+        """Resume KV cache and generation per replica, swallowing per-replica
+        failures (a dead replica must not block the others). Deferred-sync
+        replicas hand control back to the manager for VERIFYING (the
+        deferred-resume callback — fire-and-forget by design)."""
+        for replica in replicas:
+            key = self._replica_key(replica)
+            deferred = key in self._deferred_resumes
+            try:
+                await replica.resume_kv_cache()
+                await replica.resume_generation()
+            except Exception:
+                logger.warning("resume failed for replica %s (non-fatal)", key)
+                continue
+            if deferred:
+                self._deferred_resumes.discard(key)
+                if self._deferred_resume_callback is not None:
+                    try:
+                        self._deferred_resume_callback(key)
+                    except Exception:
+                        logger.warning("deferred-resume callback failed for %s (non-fatal)", key)
 
 
 async def split_weight_chunks(
