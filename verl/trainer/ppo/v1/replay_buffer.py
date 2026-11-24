@@ -125,6 +125,9 @@ class ReplayBuffer:
         sampler_kwargs (dict): Additional kwargs for the custom sampler.
         poll_interval (float, optional): Poll interval in seconds. Defaults to 2.0.
         refill_fn (callable, optional): Trainer-injected function that submits an exact number of fresh prompts.
+        poll_hook (callable, optional): Trainer-injected no-arg callable invoked once per
+            poll round while the sampler waits for data. Its raises propagate (fail-closed);
+            every other failure is the hook's own business.
         filter_groups_metric (str, optional): DAPO group-filtering metric. ``"reward"`` reads the canonical
             pre-KL reward from ``rm_scores``; other names read each trajectory's
             ``extra_fields.reward_extra_info``. ``None`` disables DAPO filtering.
@@ -143,6 +146,7 @@ class ReplayBuffer:
         sampler_kwargs: DictConfig,
         poll_interval: float = 2.0,
         refill_fn=None,
+        poll_hook=None,
         filter_groups_metric: str | None = None,
         train_batch_size: int | None = None,
         gen_batch_size: int | None = None,
@@ -156,6 +160,7 @@ class ReplayBuffer:
         self.sampler_kwargs = sampler_kwargs
         self.poll_interval = poll_interval
         self.refill_fn = refill_fn
+        self.poll_hook = poll_hook
         self.filter_groups_metric = filter_groups_metric
         self.train_batch_size = train_batch_size
         self.gen_batch_size = gen_batch_size
@@ -587,6 +592,8 @@ class ReplayBufferAsync(ReplayBuffer):
             if self._has_enough_samples(global_steps, partition_id, target_count, sampleable_keys):
                 return sampleable_keys, eviction_metrics
 
+            if self.poll_hook is not None:
+                self.poll_hook()
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="sample")

@@ -20,6 +20,7 @@ import secrets
 from pathlib import Path
 from typing import Any, Optional
 
+import psutil
 import ray
 import sglang
 import sglang.srt.entrypoints.engine
@@ -60,6 +61,11 @@ from verl.utils.sglang.sglang_quant_utils import (
 )
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.rollout.fault_tolerance import (
+    EngineProcessAccounting,
+    WeightSourceOverride,
+    engine_failure_receipt,
+)
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
 from verl.workers.rollout.sglang_rollout.utils import (
@@ -155,6 +161,7 @@ class SGLangHttpServer:
         base_gpu_id: int,
         disaggregation_role: str = "null",
         disaggregation_bootstrap_port: Optional[int] = None,
+        weight_source: Optional[WeightSourceOverride] = None,
     ):
         print(
             f"SGLang http server: {rollout_mode=}, {replica_rank=}, {node_rank=}, "
@@ -188,6 +195,20 @@ class SGLangHttpServer:
         self.base_gpu_id = base_gpu_id
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        # Checkpoint cold-start weight source for a restart relaunch; None is
+        # the normal startup path.
+        self._weight_source = weight_source
+
+        # Rollout-restart bookkeeping (inert unless rollout.restart.enabled):
+        # owned-process accounting over the engine subprocesses and the sticky
+        # engine-failed flag (late requests get an immediate receipt).
+        restart_cfg = getattr(self.config, "restart", None)
+        if restart_cfg is not None and getattr(restart_cfg, "enabled", False):
+            self._engine_cleanup = EngineProcessAccounting()
+        else:
+            self._engine_cleanup = None
+        self._engine_children = 0
+        self._engine_failed = False
 
         # PD peer linkage populated post-launch by SGLangPDReplica.set_pd_peer.
         self._pd_decode_peers: list[ActorHandle] = []
@@ -348,6 +369,10 @@ class SGLangHttpServer:
             "custom_weight_loader": custom_weight_loader or None,
             **engine_kwargs,
         }
+        if self._weight_source is not None:
+            # Checkpoint cold start: the engine cold-loads the HF export
+            # (TP/DP resharding is the engine's own cold-start capability).
+            args["model_path"] = self._weight_source.model_path
         # bf16 weight updates crash SGLang's default MoE runner on Blackwell (see default_moe_runner_backend)
         moe_runner_backend = default_moe_runner_backend(quantization_config, engine_kwargs, self.model_config.hf_config)
         if moe_runner_backend is not None:
@@ -431,12 +456,22 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
-        self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-            run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-            run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-        )
+        if self._engine_cleanup is not None:
+            # Baseline right before the engine spawns its subprocess tree.
+            self._engine_cleanup.record()
+        try:
+            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
+                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
+                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
+            )
+        finally:
+            # Record the spawned tree (or the partial tree of a failed init,
+            # so shutdown can clean it later).
+            if self._engine_cleanup is not None:
+                self._engine_cleanup.record()
+                self._engine_children = len(self._engine_cleanup.owned_pids)
 
         # In multi-node cases, non-zero rank nodes should not launch http server.
         if self.node_rank > 0:
@@ -558,6 +593,7 @@ class SGLangHttpServer:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         session_id: Optional[str] = None,
+        recover_engine_failure: bool = False,
     ) -> TokenOutput:
         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
         # paired local-prefill + remote-decode calls; decode returns the tokens
@@ -588,6 +624,11 @@ class SGLangHttpServer:
             )
             _, decode_output = await asyncio.gather(prefill_coro, decode_coro)
             return decode_output
+
+        if recover_engine_failure and self._engine_failed:
+            # Sticky receipt: the engine is known dead, so serve late requests
+            # without touching it and let the client re-route immediately.
+            return self._on_engine_failure()
 
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
@@ -658,11 +699,18 @@ class SGLangHttpServer:
         if self.lora_as_adapter:
             generate_request.lora_path = SGLANG_LORA_NAME
 
-        with RLInsightLogger.trace_state(
-            "sglang_generate",
-            state_lane_id=ray.get_runtime_context().get_actor_name(),
-        ):
-            output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        try:
+            with RLInsightLogger.trace_state(
+                "sglang_generate",
+                state_lane_id=ray.get_runtime_context().get_actor_name(),
+            ):
+                output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        except Exception:
+            # Translate into the engine-failed receipt only when the engine
+            # subprocesses are actually dead; anything else propagates.
+            if not recover_engine_failure or not self._engine_is_dead():
+                raise
+            return self._on_engine_failure()
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
@@ -734,6 +782,57 @@ class SGLangHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
+    async def get_global_steps(self):
+        """Current model weights version (rollout-restart VERIFYING stamp check)."""
+        return self.global_steps
+
+    async def check_health(self) -> None:
+        """Liveness probe for the manager's polling detection: every engine
+        subprocess spawned at launch (scheduler/detokenizer) must still be
+        alive; a dead one means the engine is gone."""
+        if self.node_rank != 0 or not hasattr(self, "tokenizer_manager"):
+            raise RuntimeError(
+                f"check_health requires the node-rank-0 launched engine "
+                f"(node_rank={self.node_rank}, launched={hasattr(self, 'tokenizer_manager')})"
+            )
+        if self._engine_cleanup is None:
+            raise RuntimeError("check_health requires rollout.restart.enabled (owned-process accounting)")
+        if self._engine_children == 0:
+            raise RuntimeError("no engine subprocesses were recorded at launch")
+        alive = self._alive_engine_children()
+        if alive < self._engine_children:
+            raise RuntimeError(f"engine subprocess dead ({alive}/{self._engine_children} alive)")
+
+    def _alive_engine_children(self) -> int:
+        owned = self._engine_cleanup.record() if self._engine_cleanup is not None else []
+        return sum(1 for proc in owned if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE)
+
+    def _engine_is_dead(self) -> bool:
+        return self._engine_children > 0 and self._alive_engine_children() < self._engine_children
+
+    def _on_engine_failure(self) -> TokenOutput:
+        """Mark the engine dead and serve the in-flight request's engine-failed
+        receipt (no partial prefix: sglang exposes no per-request progress)."""
+        self._engine_failed = True
+        return engine_failure_receipt(self.global_steps)
+
+    async def shutdown(self) -> tuple[int, float]:
+        """Verified teardown of this server's engine subprocesses: bounded
+        wait -> SIGTERM -> SIGKILL over the owned children (fail-closed; a
+        surviving engine would contend with its replacement for the same
+        devices).
+
+        Returns this actor's ``(pid, create_time)`` for the teardown's
+        witness probe — the HTTP listener lives in this process, so the
+        port is only free once this process is gone.
+        """
+        if self._engine_cleanup is None:
+            raise RuntimeError("restart is not enabled on this server: owned-process accounting was never constructed")
+        self._engine_failed = True
+        self._engine_cleanup.shutdown_owned()
+        proc = psutil.Process()
+        return proc.pid, proc.create_time()
+
     async def abort_all_requests(self):
         if self.node_rank != 0:
             return
@@ -796,8 +895,10 @@ class SGLangReplica(RolloutReplica):
         )
         self.server_class = ray.remote(SGLangHttpServer)
 
-    async def launch_servers(self):
-        """Launch http server in each node."""
+    async def launch_servers(self, weight_source: Optional[WeightSourceOverride] = None):
+        """Launch http server in each node; a restart relaunch passes its
+        checkpoint cold-start weight source through to the new server
+        actors (None is the normal startup path)."""
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
@@ -871,8 +972,9 @@ class SGLangReplica(RolloutReplica):
                 nnodes=self.nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
                 base_gpu_id=base_gpu_id,
+                weight_source=weight_source,
             )
-            self.servers.append(server)
+        self.servers.append(server)
 
         # launch http server in each node
         master_address, master_port = None, None
