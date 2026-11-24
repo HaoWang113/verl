@@ -190,7 +190,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.async_rollout_mode = True
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
-            llm_client=self.llm_server_manager.get_client(),
+            llm_client=ray.get(self.llm_server_manager.get_client.remote()),
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
 

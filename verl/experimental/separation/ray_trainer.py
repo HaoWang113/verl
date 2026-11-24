@@ -24,6 +24,7 @@ from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
+import ray
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset, Sampler
@@ -126,7 +127,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self.checkpoint_manager = CheckpointEngineManager(
             config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
             actor_wg=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
+            replicas=ray.get(self.llm_server_manager.get_replicas.remote()),
         )
 
     def _init_resource_pools(self):
@@ -435,7 +436,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
             self.checkpoint_manager.sleep_replicas()
             if self.curr_step_profile:
-                self.llm_server_manager.stop_profile()
+                ray.get(self.llm_server_manager.stop_profile.remote())
 
             timing_raw.update(combined_gen_output.meta_info["timing"])
             combined_gen_output.meta_info.pop("timing", None)
